@@ -1,0 +1,20 @@
+[Unit]
+Description=Lantano: logs de nginx hacia PostgreSQL
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nginxlog
+Group=adm
+WorkingDirectory=/opt/lantano
+ExecStart=/opt/lantano/venv/bin/python /opt/lantano/leer_log_nginx.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
