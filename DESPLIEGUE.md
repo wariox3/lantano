@@ -116,7 +116,8 @@ Mientras se use este esquema:
    hostssl  <base>  lognginx  <ip_servidor_nginx>/32  scram-sha-256
    ```
 
-   Si PostgreSQL no tiene SSL configurado, usar `host` en lugar de `hostssl`.
+   Si PostgreSQL no tiene SSL configurado, usar `host` en lugar de `hostssl` y `NGINX_PG_SSLMODE=prefer` en el
+   `.env` del paso 3.3 (la conexión viaja sin cifrar).
 
 4. Abrir el puerto 5432 en el firewall solo para la IP del servidor nginx. Con ufw:
 
@@ -163,13 +164,16 @@ Mientras se use este esquema:
    | `NGINX_PG_DATABASE_HOST` | Sí | | Host del servidor de base de datos |
    | `NGINX_PG_DATABASE_NAME` | Sí | | Nombre de la base |
    | `NGINX_PG_DATABASE_PORT` | No | `5432` | Puerto |
+   | `NGINX_SERVIDOR` | No | vacío (`NULL`) | Nombre de este servidor nginx; se guarda en la columna `servidor` de `nginx_acceso` y `nginx_error` |
+   | `NGINX_PG_SSLMODE` | No | `prefer` | `require` exige SSL; `verify-full` además valida certificado y nombre del host. La plantilla trae `require` |
+   | `NGINX_PG_SSLROOTCERT` | No | | Ruta al certificado de la CA, necesario con `verify-ca` / `verify-full` (legible por `lognginx`) |
    | `NGINX_ACCESS_GLOB` | No | `/var/log/nginx/*access*.log` | Archivos de acceso vigilados |
    | `NGINX_ERROR_GLOB` | No | `/var/log/nginx/*error*.log` | Archivos de error vigilados |
    | `NGINX_LOTE` | No | `500` | Filas por inserción |
    | `NGINX_INTERVALO` | No | `5` | Segundos máximos entre guardados |
    | `NGINX_ESCANEO` | No | `1` | Segundos de espera cuando no hay líneas nuevas |
    | `NGINX_EXCLUIR` | No | vacío | Regex sobre la URI; lo que coincide no se guarda |
-   | `NGINX_PARAMETROS_OCULTOS` | No | `token,password,key,secret` | Parámetros de URL cuyo valor se guarda como `***` |
+   | `NGINX_PARAMETROS_OCULTOS` | No | `token,password,key,secret` | Parámetros de URL cuyo valor se guarda como `***`. Basta con que el nombre contenga la palabra: `key` oculta `api_key`, `token` oculta `access_token` |
 
 4. Instalar y arrancar el servicio:
 
@@ -218,9 +222,18 @@ sudo git pull
 sudo /opt/lantano/venv/bin/pip install -r requirements.txt
 sudo cp lantano.service /etc/systemd/system/ && sudo systemctl daemon-reload
 psql -h <host> -U <admin> -d <base> -v usuario=lognginx -f crear_tablas.sql   # solo si cambió
+psql -h <host> -U <admin> -d <base> -f actualizar_bd_<n>.sql                  # las que aún no se aplicaron
 sudo systemctl restart lantano
 journalctl -u lantano -f
 ```
+
+Los scripts `actualizar_bd_<n>.sql` modifican tablas ya creadas y se ejecutan en orden, **antes** de reiniciar el
+servicio: si el código nuevo arranca sin las columnas, las inserciones fallan y los registros terminan en
+`nginx_linea_invalida`. Una instalación nueva no los necesita, porque `crear_tablas.sql` ya trae todo.
+
+| Script | Cambio |
+| --- | --- |
+| `actualizar_bd_1.sql` | Columna `servidor` en `nginx_acceso` y `nginx_error` (variable `NGINX_SERVIDOR`) |
 
 Durante el reinicio no se pierden líneas: al arrancar continúa desde la posición guardada.
 
@@ -254,6 +267,8 @@ Las tablas y los datos quedan en la base de datos; borrarlos es una decisión ap
 | --- | --- | --- |
 | `No existen las tablas. Ejecute crear_tablas.sql` y el servicio se reinicia cada 10 s | Falta el paso 2.2 o se apunta a otra base | Ejecutar `crear_tablas.sql` en la base de `NGINX_PG_DATABASE_NAME` |
 | `Error de base de datos: ... Reintento en N s.` | Sin red, `pg_hba.conf`, firewall o clave incorrecta | Probar con `psql` desde el servidor nginx (paso 2.5) |
+| `server does not support SSL, but SSL was required` | `NGINX_PG_SSLMODE=require` y PostgreSQL sin SSL | Configurar SSL en PostgreSQL o usar `NGINX_PG_SSLMODE=prefer` |
+| `root certificate file ... does not exist` o `certificate verify failed` | `verify-full` sin `NGINX_PG_SSLROOTCERT` válido o el host no coincide con el certificado | Revisar la ruta y permisos del certificado y que `NGINX_PG_DATABASE_HOST` sea el nombre del certificado |
 | `permission denied for table ...` | Permisos no otorgados al usuario del servicio | Ejecutar `crear_tablas.sql` con `-v usuario=lognginx` |
 | `No se puede abrir ...: Permission denied` | `lognginx` no está en el grupo `adm` | `sudo usermod -aG adm lognginx && sudo systemctl restart lantano` |
 | `No hay archivos que coincidan con ...` | No existen `/var/log/nginx/access.log` ni `error.log` | Revisar el paso 1 y las rutas en `NGINX_ACCESS_GLOB` / `NGINX_ERROR_GLOB` |

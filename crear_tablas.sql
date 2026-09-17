@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS nginx_acceso (
     request_time NUMERIC(10,3),
     upstream_time TEXT,
     upstream TEXT,
+    servidor TEXT,
     creado TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS nginx_acceso_fecha_idx ON nginx_acceso (fecha);
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS nginx_error (
     upstream TEXT,
     host TEXT,
     referer TEXT,
+    servidor TEXT,
     creado TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS nginx_error_fecha_idx ON nginx_error (fecha);

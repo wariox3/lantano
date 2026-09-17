@@ -38,6 +38,9 @@ INTERVALO = config('NGINX_INTERVALO', default=5, cast=float)
 ESCANEO = config('NGINX_ESCANEO', default=1, cast=float)
 EXCLUIR = config('NGINX_EXCLUIR', default='')
 PARAMETROS_OCULTOS = config('NGINX_PARAMETROS_OCULTOS', default='token,password,key,secret', cast=Csv())
+SERVIDOR = config('NGINX_SERVIDOR', default='') or None
+SSLMODE = config('NGINX_PG_SSLMODE', default='prefer')
+SSLROOTCERT = config('NGINX_PG_SSLROOTCERT', default='') or None
 
 DESCUBRIMIENTO = 30        # segundos entre búsquedas de archivos nuevos
 GRACIA_ROTACION = 5        # segundos leyendo el archivo rotado antes de cambiar al nuevo
@@ -46,8 +49,9 @@ ESPERAS = (5, 10, 30, 60)  # reintentos de conexión
 
 PATRON_EXCLUIR = re.compile(EXCLUIR) if EXCLUIR else None
 PARAMETROS_OCULTOS = [p for p in PARAMETROS_OCULTOS if p]
+# Oculta los parámetros cuyo nombre contiene alguna de las palabras (api_key, access_token, ...)
 PATRON_OCULTOS = re.compile(
-    r'([?&](?:' + '|'.join(re.escape(p) for p in PARAMETROS_OCULTOS) + r')=)[^&#\s"]*',
+    r'([?&][^=&#\s"]*(?:' + '|'.join(re.escape(p) for p in PARAMETROS_OCULTOS) + r')[^=&#\s"]*=)[^&#\s"]*',
     re.IGNORECASE,
 ) if PARAMETROS_OCULTOS else None
 
@@ -60,12 +64,12 @@ PATRON_CAMPOS_ERROR = re.compile(
 
 SQL_ACCESO = '''
     INSERT INTO nginx_acceso (fecha, archivo, host, ip, metodo, uri, protocolo, status, bytes,
-                              referer, user_agent, request_time, upstream_time, upstream)
+                              referer, user_agent, request_time, upstream_time, upstream, servidor)
     VALUES %s
 '''
 SQL_ERROR = '''
     INSERT INTO nginx_error (fecha, archivo, nivel, pid, tid, cid, mensaje, client, server,
-                             request, upstream, host, referer)
+                             request, upstream, host, referer, servidor)
     VALUES %s
 '''
 SQL_INVALIDA = 'INSERT INTO nginx_linea_invalida (archivo, linea, motivo) VALUES %s'
@@ -86,6 +90,8 @@ def crear_conexion():
         host=config('NGINX_PG_DATABASE_HOST'),
         port=config('NGINX_PG_DATABASE_PORT', default='5432'),
         dbname=config('NGINX_PG_DATABASE_NAME'),
+        sslmode=SSLMODE,
+        sslrootcert=SSLROOTCERT,
         connect_timeout=10,
         application_name='leer_log_nginx',
         keepalives=1,
@@ -156,6 +162,7 @@ def parsear_acceso(linea, archivo):
         decimal(datos.get('request_time')),
         texto(datos.get('upstream_time')),
         texto(datos.get('upstream')),
+        SERVIDOR,
     )
 
 
@@ -191,6 +198,7 @@ def parsear_error(linea, archivo):
         ocultar(texto(campos.get('upstream'))),
         texto(campos.get('host')),
         ocultar(texto(campos.get('referrer'))),
+        SERVIDOR,
     )
 
 
@@ -403,7 +411,7 @@ class LectorNginx:
             else:
                 self.pendientes['error'].append(parsear_error(contenido, archivo.ruta))
         except (ValueError, TypeError) as e:
-            self.pendientes['invalida'].append((archivo.ruta, contenido, f'{type(e).__name__}: {e}'))
+            self.pendientes['invalida'].append((archivo.ruta, ocultar(contenido), f'{type(e).__name__}: {e}'))
 
     def leer(self, archivo):
         """Lee las líneas nuevas. Devuelve True si leyó algo."""
