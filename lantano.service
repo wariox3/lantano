@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=nginxlog
+User=lognginx
 Group=adm
 WorkingDirectory=/opt/lantano
 ExecStart=/opt/lantano/venv/bin/python /opt/lantano/leer_log_nginx.py

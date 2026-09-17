@@ -6,11 +6,11 @@ consultas de ejemplo están en el [README](README.md).
 ```
 servidor nginx                                   servidor de base de datos
 ┌──────────────────────────────────────┐         ┌──────────────────────┐
-│ /var/log/nginx/*_access.log (JSON)   │         │                      │
-│ /var/log/nginx/*_error.log           │         │  PostgreSQL          │
+│ /var/log/nginx/access.log (JSON)     │         │                      │
+│ /var/log/nginx/error.log             │         │  PostgreSQL          │
 │              │                       │  5432   │                      │
 │              ▼                       │ ──────► │  nginx_acceso        │
-│ lantano.service (usuario nginxlog)   │         │  nginx_error         │
+│ lantano.service (usuario lognginx)   │         │  nginx_error         │
 │ /opt/lantano/leer_log_nginx.py       │         │  nginx_posicion      │
 └──────────────────────────────────────┘         │  nginx_linea_invalida│
                                                  └──────────────────────┘
@@ -35,7 +35,23 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
 
 *Servidor nginx.*
 
-1. Crear `/etc/nginx/conf.d/log_json.conf`:
+Los sitios no declaran `access_log` ni `error_log`: todos heredan los de `/etc/nginx/nginx.conf` y escriben en
+`/var/log/nginx/access.log` y `/var/log/nginx/error.log`. Se mantiene así y solo se cambia el formato del log de
+acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y `nginx_error`.
+
+1. Confirmar que ningún sitio declara su propio `access_log` (solo deben aparecer las líneas de `nginx.conf`):
+
+   ```bash
+   sudo nginx -T 2>/dev/null | grep -nE '^# configuration file|access_log|error_log'
+   ```
+
+2. Respaldar `/etc/nginx/nginx.conf` y, dentro del bloque `http`, reemplazar la línea
+   `access_log /var/log/nginx/access.log;` por el formato JSON y el log de acceso que lo usa:
+
+   ```bash
+   sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.antes-lantano
+   sudo nano /etc/nginx/nginx.conf
+   ```
 
    ```nginx
    log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$remote_addr",'
@@ -43,15 +59,12 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
      '"status":"$status","bytes":"$body_bytes_sent","referer":"$http_referer",'
      '"user_agent":"$http_user_agent","request_time":"$request_time",'
      '"upstream_time":"$upstream_response_time","upstream":"$upstream_addr"}';
+   access_log /var/log/nginx/access.log json_log;
    ```
 
-2. En cada sitio de `/etc/nginx/sites-available/`, usar ese formato con nombres que contengan `access` y
-   `error` (son los patrones que vigila el servicio):
-
-   ```nginx
-   access_log /var/log/nginx/proyecto_access.log json_log;
-   error_log  /var/log/nginx/proyecto_error.log;
-   ```
+   - `log_format` debe quedar **antes** de `access_log`; si no, `nginx -t` falla con `unknown log format`.
+   - La línea `access_log` original no debe quedar: nginx escribiría cada petición dos veces en el mismo
+     archivo, una en cada formato.
 
 3. Validar y recargar:
 
@@ -59,11 +72,21 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
    sudo nginx -t && sudo systemctl reload nginx
    ```
 
-4. Comprobar que las líneas nuevas salen en JSON:
+4. Hacer una petición a cada uno de los 3 sitios y comprobar que las líneas nuevas salen en JSON:
 
    ```bash
-   sudo tail -n 2 /var/log/nginx/proyecto_access.log
+   sudo tail -n 3 /var/log/nginx/access.log
    ```
+
+Mientras se use este esquema:
+
+- Un sitio nuevo tampoco debe declarar `access_log`: si lo hace, deja de escribir en `access.log` con formato JSON.
+- Si otra herramienta del servidor lee `access.log` en el formato por defecto (fail2ban, GoAccess, AWStats),
+  deja de entenderlo.
+- Al actualizar el paquete de nginx, `apt` puede preguntar si conservar el `nginx.conf` modificado: responder
+  que se conserve (opción por defecto `N`).
+- Para volver al formato por defecto: `sudo cp /etc/nginx/nginx.conf.antes-lantano /etc/nginx/nginx.conf`,
+  `nginx -t` y `reload`.
 
 ## Paso 2: base de datos
 
@@ -73,7 +96,7 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
 
    ```sql
    CREATE DATABASE <base>;
-   CREATE USER nginxlog WITH PASSWORD '<clave>';
+   CREATE USER lognginx WITH PASSWORD '<clave>';
    ```
 
 2. Crear tablas, índices y permisos, conectado a esa base. `crear_tablas.sql` está en el repositorio; se puede
@@ -81,7 +104,7 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
    varias veces:
 
    ```bash
-   psql -h <host> -U <admin> -d <base> -v usuario=nginxlog -f crear_tablas.sql
+   psql -h <host> -U <admin> -d <base> -v usuario=lognginx -f crear_tablas.sql
    ```
 
    El usuario del servicio queda con `SELECT, INSERT` sobre `nginx_acceso`, `nginx_error` y
@@ -90,7 +113,7 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
 3. Permitir la conexión en `pg_hba.conf` y recargar PostgreSQL (`sudo systemctl reload postgresql`):
 
    ```
-   hostssl  <base>  nginxlog  <ip_servidor_nginx>/32  scram-sha-256
+   hostssl  <base>  lognginx  <ip_servidor_nginx>/32  scram-sha-256
    ```
 
    Si PostgreSQL no tiene SSL configurado, usar `host` en lugar de `hostssl`.
@@ -104,7 +127,7 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
 5. Desde el **servidor nginx**, probar la conexión:
 
    ```bash
-   psql "host=<host> dbname=<base> user=nginxlog" -c 'SELECT count(*) FROM nginx_posicion;'
+   psql "host=<host> dbname=<base> user=lognginx" -c 'SELECT count(*) FROM nginx_posicion;'
    ```
 
 ## Paso 3: instalación del servicio
@@ -114,7 +137,7 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
 1. Crear el usuario del sistema. Pertenece al grupo `adm` para poder leer `/var/log/nginx`:
 
    ```bash
-   sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm nginxlog
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm lognginx
    ```
 
 2. Descargar el código e instalar dependencias:
@@ -130,7 +153,7 @@ nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
    ```bash
    sudo cp /opt/lantano/.env.example /opt/lantano/.env
    sudo nano /opt/lantano/.env
-   sudo chown root:nginxlog /opt/lantano/.env && sudo chmod 640 /opt/lantano/.env
+   sudo chown root:lognginx /opt/lantano/.env && sudo chmod 640 /opt/lantano/.env
    ```
 
    | Variable | Obligatoria | Por defecto | Uso |
@@ -181,7 +204,8 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
    SELECT count(*) FROM nginx_linea_invalida WHERE creado > now() - interval '1 hour';
    ```
 
-   Si `nginx_linea_invalida` se llena con líneas de acceso, algún sitio sigue sin `json_log` (paso 1).
+   Si `nginx_linea_invalida` se llena con líneas de acceso, `access.log` sigue recibiendo el formato por defecto:
+   revisar que en `nginx.conf` no quedó la línea `access_log` original (paso 1.2).
 
 3. Probar un reinicio: `sudo systemctl restart lantano` y comprobar en el log que dice `continúa en el byte ...`.
 
@@ -193,7 +217,7 @@ sudo git log --oneline -1          # anotar el commit actual por si hay que reve
 sudo git pull
 sudo /opt/lantano/venv/bin/pip install -r requirements.txt
 sudo cp lantano.service /etc/systemd/system/ && sudo systemctl daemon-reload
-psql -h <host> -U <admin> -d <base> -v usuario=nginxlog -f crear_tablas.sql   # solo si cambió
+psql -h <host> -U <admin> -d <base> -v usuario=lognginx -f crear_tablas.sql   # solo si cambió
 sudo systemctl restart lantano
 journalctl -u lantano -f
 ```
@@ -219,7 +243,7 @@ solo crea lo que no existe, así que revertir el código no requiere tocar la ba
 sudo systemctl disable --now lantano
 sudo rm /etc/systemd/system/lantano.service && sudo systemctl daemon-reload
 sudo rm -rf /opt/lantano
-sudo userdel nginxlog
+sudo userdel lognginx
 ```
 
 Las tablas y los datos quedan en la base de datos; borrarlos es una decisión aparte.
@@ -230,9 +254,9 @@ Las tablas y los datos quedan en la base de datos; borrarlos es una decisión ap
 | --- | --- | --- |
 | `No existen las tablas. Ejecute crear_tablas.sql` y el servicio se reinicia cada 10 s | Falta el paso 2.2 o se apunta a otra base | Ejecutar `crear_tablas.sql` en la base de `NGINX_PG_DATABASE_NAME` |
 | `Error de base de datos: ... Reintento en N s.` | Sin red, `pg_hba.conf`, firewall o clave incorrecta | Probar con `psql` desde el servidor nginx (paso 2.5) |
-| `permission denied for table ...` | Permisos no otorgados al usuario del servicio | Ejecutar `crear_tablas.sql` con `-v usuario=nginxlog` |
-| `No se puede abrir ...: Permission denied` | `nginxlog` no está en el grupo `adm` | `sudo usermod -aG adm nginxlog && sudo systemctl restart lantano` |
-| `No hay archivos que coincidan con ...` | Los nombres de log no contienen `access`/`error` | Renombrar en nginx o ajustar `NGINX_ACCESS_GLOB` / `NGINX_ERROR_GLOB` |
+| `permission denied for table ...` | Permisos no otorgados al usuario del servicio | Ejecutar `crear_tablas.sql` con `-v usuario=lognginx` |
+| `No se puede abrir ...: Permission denied` | `lognginx` no está en el grupo `adm` | `sudo usermod -aG adm lognginx && sudo systemctl restart lantano` |
+| `No hay archivos que coincidan con ...` | No existen `/var/log/nginx/access.log` ni `error.log` | Revisar el paso 1 y las rutas en `NGINX_ACCESS_GLOB` / `NGINX_ERROR_GLOB` |
 | `fue rotado y no se encontró el archivo anterior; pueden faltar líneas` | El servicio estuvo detenido durante una rotación y el archivo ya se comprimió | Sin acción; vigilar que el servicio no quede detenido más de un día |
 | `ModuleNotFoundError` o `UndefinedValueError` | Dependencias sin instalar o falta una variable obligatoria en `.env` | Repetir `pip install` o completar `.env` |
 
@@ -240,7 +264,7 @@ Para ver más detalle temporalmente, ejecutar a mano con el usuario del servicio
 
 ```bash
 sudo systemctl stop lantano
-sudo -u nginxlog /opt/lantano/venv/bin/python /opt/lantano/leer_log_nginx.py --debug
+sudo -u lognginx /opt/lantano/venv/bin/python /opt/lantano/leer_log_nginx.py --debug
 sudo systemctl start lantano
 ```
 
