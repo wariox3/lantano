@@ -59,13 +59,18 @@ acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y
      '"method":"$request_method","uri":"$request_uri","protocol":"$server_protocol",'
      '"status":"$status","bytes":"$body_bytes_sent","referer":"$http_referer",'
      '"user_agent":"$http_user_agent","request_time":"$request_time",'
-     '"upstream_time":"$upstream_response_time","upstream":"$upstream_addr"}';
+     '"upstream_time":"$upstream_response_time","upstream":"$upstream_addr",'
+     '"usuario":"$upstream_http_x_usuario"}';
    access_log /var/log/nginx/access.log json_log;
    ```
 
    - `log_format` debe quedar **antes** de `access_log`; si no, `nginx -t` falla con `unknown log format`.
    - La línea `access_log` original no debe quedar: nginx escribiría cada petición dos veces en el mismo
      archivo, una en cada formato.
+   - `usuario` es la cabecera de respuesta `X-Usuario` que envía la aplicación con el usuario autenticado. Los
+     servicios que no la envían dejan el campo vacío y se guarda `NULL`; no hace falta configurar nada en ellos.
+     En los que sí la envían, agregar `proxy_hide_header X-Usuario;` en su `location` para que no llegue al
+     navegador. Un cliente no puede falsificarla: es una cabecera de la respuesta del backend, no de la petición.
 
 3. Validar y recargar:
 

@@ -70,7 +70,7 @@ PATRON_CAMPOS_ERROR = re.compile(
 
 SQL_ACCESO = '''
     INSERT INTO nginx_acceso (fecha, archivo, host, ip, metodo, ruta, parametros, protocolo, status, bytes,
-                              referer, user_agent, request_time, upstream_time, upstream, servidor)
+                              referer, user_agent, request_time, upstream_time, upstream, servidor, usuario)
     VALUES %s
 '''
 SQL_ERROR = '''
@@ -171,6 +171,7 @@ def parsear_acceso(linea, archivo):
         texto(datos.get('upstream_time')),
         texto(datos.get('upstream')),
         SERVIDOR,
+        texto(datos.get('usuario')),  # solo lo envían algunos servicios; si falta, NULL
     )
 
 
