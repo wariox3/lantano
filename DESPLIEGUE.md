@@ -55,12 +55,18 @@ acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y
    ```
 
    ```nginx
+   # Solo el prefijo de la API Key (erp_<hex>); el secreto después del punto nunca se escribe en el log
+   map $http_x_api_key $api_key_prefijo {
+       "~^(?<prefijo>erp_[0-9a-f]+)\."  $prefijo;
+       default                          "";
+   }
+
    log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$remote_addr",'
      '"method":"$request_method","uri":"$request_uri","protocol":"$server_protocol",'
      '"status":"$status","bytes":"$body_bytes_sent","referer":"$http_referer",'
      '"user_agent":"$http_user_agent","request_time":"$request_time",'
      '"upstream_time":"$upstream_response_time","upstream":"$upstream_addr",'
-     '"usuario":"$upstream_http_x_usuario"}';
+     '"usuario":"$upstream_http_x_usuario","api_key":"$api_key_prefijo"}';
    access_log /var/log/nginx/access.log json_log;
    ```
 
@@ -71,6 +77,10 @@ acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y
      servicios que no la envían dejan el campo vacío y se guarda `NULL`; no hace falta configurar nada en ellos.
      En los que sí la envían, agregar `proxy_hide_header X-Usuario;` en su `location` para que no llegue al
      navegador. Un cliente no puede falsificarla: es una cabecera de la respuesta del backend, no de la petición.
+   - `api_key` es el prefijo de la cabecera `X-API-Key` de la petición (`erp_ab12cd34` de
+     `erp_ab12cd34.<secreto>`). **Nunca registrar `$http_x_api_key` directamente**: escribiría la llave completa en
+     el log. Es el prefijo que envió el cliente, no uno validado: con `status` 401 la llave era inválida o estaba
+     expirada. Lo que no tiene el formato `erp_<hex>.` queda vacío.
 
 3. Validar y recargar:
 

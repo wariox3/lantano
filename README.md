@@ -25,6 +25,8 @@ Instalación, verificación, actualización y reversión en producción: [DESPLI
   para buscar y agrupar por endpoint con igualdad en lugar de `LIKE`.
 - `usuario` viene de la cabecera `X-Usuario` que envía la aplicación (ver el `log_format` en
   [DESPLIEGUE.md](DESPLIEGUE.md)). Es `NULL` en los servicios que no la envían.
+- `api_key` es solo el prefijo de la cabecera `X-API-Key` (`erp_<hex>`), extraído en nginx; si llegara la llave
+  completa, se descarta lo que va después del punto. Es el que envió el cliente: con `status` 401 era inválida.
 - Las fechas del error log no traen zona horaria: se interpretan con la zona del servidor nginx.
 
 ## Migraciones
@@ -61,6 +63,11 @@ ORDER BY fecha DESC;
 SELECT fecha, host, metodo, ruta, status FROM nginx_acceso
 WHERE usuario = '42' AND fecha > now() - interval '24 hours'
 ORDER BY fecha DESC;
+
+-- Uso por API Key en las últimas 24 h (401 = llave inválida o expirada)
+SELECT api_key, count(*) AS total, count(*) FILTER (WHERE status = 401) AS rechazadas
+FROM nginx_acceso WHERE api_key IS NOT NULL AND fecha > now() - interval '24 hours'
+GROUP BY api_key ORDER BY total DESC;
 
 -- IPs con más 404
 SELECT ip, count(*) FROM nginx_acceso

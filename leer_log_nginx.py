@@ -70,7 +70,8 @@ PATRON_CAMPOS_ERROR = re.compile(
 
 SQL_ACCESO = '''
     INSERT INTO nginx_acceso (fecha, archivo, host, ip, metodo, ruta, parametros, protocolo, status, bytes,
-                              referer, user_agent, request_time, upstream_time, upstream, servidor, usuario)
+                              referer, user_agent, request_time, upstream_time, upstream, servidor, usuario,
+                              api_key)
     VALUES %s
 '''
 SQL_ERROR = '''
@@ -143,6 +144,12 @@ def ocultar(valor):
     return valor
 
 
+def prefijo_api_key(valor):
+    """Solo el prefijo (erp_<hex>): si llegara la llave completa, descarta el secreto después del punto."""
+    valor = texto(valor)
+    return texto(valor.split('.', 1)[0]) if valor else None
+
+
 def parsear_acceso(linea, archivo):
     """Devuelve la fila para nginx_acceso, None si la línea está excluida o lanza ValueError."""
     datos = json.loads(linea)
@@ -172,6 +179,7 @@ def parsear_acceso(linea, archivo):
         texto(datos.get('upstream')),
         SERVIDOR,
         texto(datos.get('usuario')),  # solo lo envían algunos servicios; si falta, NULL
+        prefijo_api_key(datos.get('api_key')),
     )
 
 
