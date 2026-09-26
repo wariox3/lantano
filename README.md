@@ -72,6 +72,11 @@ SELECT ip_real, count(*) FROM nginx_acceso
 WHERE status = 404 AND ip_real IS NOT NULL AND fecha > now() - interval '24 hours'
 GROUP BY ip_real ORDER BY 2 DESC LIMIT 20;
 
+-- Últimos errores 5xx (usa el índice parcial de errores)
+SELECT fecha, host, ruta, status, ip_real FROM nginx_acceso
+WHERE status >= 500 AND fecha > now() - interval '1 hour'
+ORDER BY fecha DESC;
+
 -- Actividad de una IP en la última hora (usa el índice ip_real, fecha)
 SELECT fecha, host, metodo, ruta, status, api_key FROM nginx_acceso
 WHERE ip_real = '190.1.2.3' AND fecha > now() - interval '1 hour'
