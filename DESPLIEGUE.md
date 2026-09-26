@@ -12,7 +12,8 @@ servidor nginx                                   servidor de base de datos
 │              ▼                       │ ──────► │  nginx_acceso        │
 │ lantano.service (usuario lognginx)   │         │  nginx_error         │
 │ /opt/lantano/leer_log_nginx.py       │         │  nginx_posicion      │
-└──────────────────────────────────────┘         │  nginx_linea_invalida│
+│ /opt/lantano/migrar.py (admin)       │         │  nginx_linea_invalida│
+└──────────────────────────────────────┘         │  lantano_migracion   │
                                                  └──────────────────────┘
 ```
 
@@ -22,7 +23,7 @@ servidor nginx                                   servidor de base de datos
 | --- | --- | --- |
 | Python 3 con `venv` | Servidor nginx | Probado con 3.12 (`sudo apt install python3-venv`) |
 | git | Servidor nginx | Acceso a `https://github.com/wariox3/lantano.git` |
-| `psql` (postgresql-client) | Servidor nginx | Para probar la conexión y ejecutar `crear_tablas.sql` |
+| `psql` (postgresql-client) | Servidor nginx | Para probar la conexión |
 | nginx + logrotate | Servidor nginx | Con `delaycompress` (valor por defecto en Ubuntu) |
 | PostgreSQL | Servidor de base de datos | Un usuario que pueda crear bases, usuarios y tablas |
 | Red | Ambos | Puerto 5432 abierto solo desde la IP del servidor nginx |
@@ -92,43 +93,34 @@ Mientras se use este esquema:
 
 *Servidor de base de datos.*
 
-1. Crear la base y el usuario del servicio (como administrador):
+1. Crear la base y el usuario del servicio (como administrador). Las tablas las crea `migrar.py` en el paso 3.4:
 
    ```sql
    CREATE DATABASE <base>;
    CREATE USER lognginx WITH PASSWORD '<clave>';
    ```
 
-2. Crear tablas, índices y permisos, conectado a esa base. `crear_tablas.sql` está en el repositorio; se puede
-   ejecutar desde el servidor nginx después del paso 3.2. Es transaccional (todo o nada) y se puede ejecutar
-   varias veces:
-
-   ```bash
-   psql -h <host> -U <admin> -d <base> -v usuario=lognginx -f crear_tablas.sql
-   ```
-
-   El usuario del servicio queda con `SELECT, INSERT` sobre `nginx_acceso`, `nginx_error` y
-   `nginx_linea_invalida`, y `SELECT, INSERT, UPDATE` sobre `nginx_posicion`. No puede borrar ni modificar logs.
-
-3. Permitir la conexión en `pg_hba.conf` y recargar PostgreSQL (`sudo systemctl reload postgresql`):
+2. Permitir la conexión en `pg_hba.conf` y recargar PostgreSQL (`sudo systemctl reload postgresql`). La segunda
+   línea es para el usuario administrador con el que se ejecuta `migrar.py` desde el servidor nginx:
 
    ```
    hostssl  <base>  lognginx  <ip_servidor_nginx>/32  scram-sha-256
+   hostssl  <base>  <admin>   <ip_servidor_nginx>/32  scram-sha-256
    ```
 
    Si PostgreSQL no tiene SSL configurado, usar `host` en lugar de `hostssl` y `NGINX_PG_SSLMODE=prefer` en el
    `.env` del paso 3.3 (la conexión viaja sin cifrar).
 
-4. Abrir el puerto 5432 en el firewall solo para la IP del servidor nginx. Con ufw:
+3. Abrir el puerto 5432 en el firewall solo para la IP del servidor nginx. Con ufw:
 
    ```bash
    sudo ufw allow from <ip_servidor_nginx> to any port 5432 proto tcp
    ```
 
-5. Desde el **servidor nginx**, probar la conexión:
+4. Desde el **servidor nginx**, probar la conexión:
 
    ```bash
-   psql "host=<host> dbname=<base> user=lognginx" -c 'SELECT count(*) FROM nginx_posicion;'
+   psql "host=<host> dbname=<base> user=lognginx" -c 'SELECT 1;'
    ```
 
 ## Paso 3: instalación del servicio
@@ -164,7 +156,7 @@ Mientras se use este esquema:
    | `NGINX_PG_DATABASE_HOST` | Sí | | Host del servidor de base de datos |
    | `NGINX_PG_DATABASE_NAME` | Sí | | Nombre de la base |
    | `NGINX_PG_DATABASE_PORT` | No | `5432` | Puerto |
-   | `NGINX_SERVIDOR` | No | vacío (`NULL`) | Nombre de este servidor nginx; se guarda en la columna `servidor` de `nginx_acceso` y `nginx_error` |
+   | `NGINX_SERVIDOR` | No | vacío (`NULL`) | Nombre de este servidor nginx; se guarda en la columna `servidor` de `nginx_acceso` y `nginx_error`. **Obligatoria y distinta en cada servidor** si varios escriben en la misma base: también separa sus posiciones en `nginx_posicion`. No cambiarla después sin mover sus filas de `nginx_posicion`, o el servicio arranca desde el final de los archivos |
    | `NGINX_PG_SSLMODE` | No | `prefer` | `require` exige SSL; `verify-full` además valida certificado y nombre del host. La plantilla trae `require` |
    | `NGINX_PG_SSLROOTCERT` | No | | Ruta al certificado de la CA, necesario con `verify-ca` / `verify-full` (legible por `lognginx`) |
    | `NGINX_ACCESS_GLOB` | No | `/var/log/nginx/*access*.log` | Archivos de acceso vigilados |
@@ -175,7 +167,18 @@ Mientras se use este esquema:
    | `NGINX_EXCLUIR` | No | vacío | Regex sobre la URI; lo que coincide no se guarda |
    | `NGINX_PARAMETROS_OCULTOS` | No | `token,password,key,secret` | Parámetros de URL cuyo valor se guarda como `***`. Basta con que el nombre contenga la palabra: `key` oculta `api_key`, `token` oculta `access_token` |
 
-4. Instalar y arrancar el servicio:
+4. Crear las tablas y los permisos con un usuario administrador de PostgreSQL. Toma host, base, SSL y usuario del
+   servicio del `.env`, y pide la clave del administrador (o la toma de `PGPASSWORD` / `~/.pgpass`):
+
+   ```bash
+   cd /opt/lantano && sudo venv/bin/python migrar.py --admin <admin>
+   ```
+
+   Debe terminar con `Aplicada 0001_inicial.sql` y `Permisos aplicados a lognginx.` El usuario del servicio queda
+   con `SELECT, INSERT` sobre `nginx_acceso`, `nginx_error` y `nginx_linea_invalida`, `SELECT, INSERT, UPDATE`
+   sobre `nginx_posicion` y `SELECT` sobre `lantano_migracion`. No puede borrar ni modificar logs ni el esquema.
+
+5. Instalar y arrancar el servicio:
 
    ```bash
    sudo cp /opt/lantano/lantano.service /etc/systemd/system/
@@ -203,8 +206,8 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
    ```
 
    ```sql
-   SELECT archivo, posicion, actualizado FROM nginx_posicion ORDER BY actualizado DESC;
-   SELECT fecha, host, uri, status FROM nginx_acceso ORDER BY id DESC LIMIT 5;
+   SELECT servidor, archivo, posicion, actualizado FROM nginx_posicion ORDER BY actualizado DESC;
+   SELECT fecha, host, ruta, parametros, status FROM nginx_acceso ORDER BY id DESC LIMIT 5;
    SELECT count(*) FROM nginx_linea_invalida WHERE creado > now() - interval '1 hour';
    ```
 
@@ -219,21 +222,23 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
 cd /opt/lantano
 sudo git log --oneline -1          # anotar el commit actual por si hay que revertir
 sudo git pull
-sudo /opt/lantano/venv/bin/pip install -r requirements.txt
+sudo venv/bin/pip install -r requirements.txt
 sudo cp lantano.service /etc/systemd/system/ && sudo systemctl daemon-reload
-psql -h <host> -U <admin> -d <base> -v usuario=lognginx -f crear_tablas.sql   # solo si cambió
-psql -h <host> -U <admin> -d <base> -f actualizar_bd_<n>.sql                  # las que aún no se aplicaron
+sudo venv/bin/python migrar.py --admin <admin>     # aplica las migraciones pendientes; si no hay, no cambia nada
 sudo systemctl restart lantano
 journalctl -u lantano -f
 ```
 
-Los scripts `actualizar_bd_<n>.sql` modifican tablas ya creadas y se ejecutan en orden, **antes** de reiniciar el
-servicio: si el código nuevo arranca sin las columnas, las inserciones fallan y los registros terminan en
-`nginx_linea_invalida`. Una instalación nueva no los necesita, porque `crear_tablas.sql` ya trae todo.
+`migrar.py` va **antes** del reinicio: al arrancar, el servicio compara la versión de la base
+(`lantano_migracion`) con la última migración de su código y se detiene si no coinciden. Para ver qué está
+aplicado: `sudo venv/bin/python migrar.py --admin <admin> --estado`.
 
-| Script | Cambio |
-| --- | --- |
-| `actualizar_bd_1.sql` | Columna `servidor` en `nginx_acceso` y `nginx_error` (variable `NGINX_SERVIDOR`) |
+Con varios servidores nginx en la misma base, la migración se ejecuta una sola vez (desde el primero que se
+actualiza; en los demás `migrar.py` solo reaplica permisos). Los servidores que aún tienen el código anterior:
+
+- Si siguen corriendo y la migración cambió columnas que usan, reintentan sin avanzar ni perder líneas hasta que
+  se actualicen.
+- Si se reinician antes de actualizarse, se detienen con `más nueva que el código`.
 
 Durante el reinicio no se pierden líneas: al arrancar continúa desde la posición guardada.
 
@@ -242,13 +247,19 @@ Durante el reinicio no se pierden líneas: al arrancar continúa desde la posici
 ```bash
 cd /opt/lantano
 sudo git checkout <commit_anterior>
-sudo /opt/lantano/venv/bin/pip install -r requirements.txt
+sudo venv/bin/pip install -r requirements.txt
 sudo cp lantano.service /etc/systemd/system/ && sudo systemctl daemon-reload
 sudo systemctl restart lantano
 ```
 
-Para volver a la última versión: `sudo git checkout main && sudo git pull` y repetir los pasos. `crear_tablas.sql`
-solo crea lo que no existe, así que revertir el código no requiere tocar la base de datos.
+Para volver a la última versión: `sudo git checkout main && sudo git pull` y repetir los pasos.
+
+Si entre ambos commits hay migraciones nuevas, el servicio no arranca (`más nueva que el código`): las migraciones
+solo avanzan. En ese caso hay dos opciones:
+
+- **Mejor:** corregir hacia adelante con una migración nueva en lugar de revertir el código.
+- Deshacer a mano los cambios de esas migraciones y borrar sus filas: `DELETE FROM lantano_migracion WHERE
+  version > <n>;`, donde `<n>` es la última migración del commit anterior (`ls migraciones/`).
 
 ## Desinstalar
 
@@ -265,14 +276,18 @@ Las tablas y los datos quedan en la base de datos; borrarlos es una decisión ap
 
 | Síntoma en `journalctl -u lantano` | Causa | Solución |
 | --- | --- | --- |
-| `No existen las tablas. Ejecute crear_tablas.sql` y el servicio se reinicia cada 10 s | Falta el paso 2.2 o se apunta a otra base | Ejecutar `crear_tablas.sql` en la base de `NGINX_PG_DATABASE_NAME` |
-| `Error de base de datos: ... Reintento en N s.` | Sin red, `pg_hba.conf`, firewall o clave incorrecta | Probar con `psql` desde el servidor nginx (paso 2.5) |
+| `La base de datos no tiene las tablas. Ejecute migrar.py.` y el servicio se reinicia cada 10 s | Falta el paso 3.4 o se apunta a otra base | Ejecutar `migrar.py` (usa la base de `NGINX_PG_DATABASE_NAME`) |
+| `La base de datos está en la versión N y el código espera la M. Ejecute migrar.py.` | Se actualizó el código sin migrar | Ejecutar `migrar.py` |
+| `La base de datos está en la versión N, más nueva que el código (M). Actualice el código.` | Otro servidor ya migró la base, o se revirtió el código | Actualizar el código (ver [Actualizar](#actualizar)) o [Revertir](#revertir) |
+| `Error de base de datos: column "..." of relation "..." does not exist. Reintento en N s.` | Otro servidor migró la base y este sigue corriendo con el código anterior | Actualizar el código de este servidor; mientras tanto no pierde líneas |
+| `Error de base de datos: ... Reintento en N s.` | Sin red, `pg_hba.conf`, firewall o clave incorrecta | Probar con `psql` desde el servidor nginx (paso 2.4) |
 | `server does not support SSL, but SSL was required` | `NGINX_PG_SSLMODE=require` y PostgreSQL sin SSL | Configurar SSL en PostgreSQL o usar `NGINX_PG_SSLMODE=prefer` |
 | `root certificate file ... does not exist` o `certificate verify failed` | `verify-full` sin `NGINX_PG_SSLROOTCERT` válido o el host no coincide con el certificado | Revisar la ruta y permisos del certificado y que `NGINX_PG_DATABASE_HOST` sea el nombre del certificado |
-| `permission denied for table ...` | Permisos no otorgados al usuario del servicio | Ejecutar `crear_tablas.sql` con `-v usuario=lognginx` |
+| `permission denied for table ...` | Permisos no otorgados al usuario del servicio | Ejecutar `migrar.py`, que reaplica `permisos.sql`; el servicio reintenta sin perder líneas |
 | `No se puede abrir ...: Permission denied` | `lognginx` no está en el grupo `adm` | `sudo usermod -aG adm lognginx && sudo systemctl restart lantano` |
 | `No hay archivos que coincidan con ...` | No existen `/var/log/nginx/access.log` ni `error.log` | Revisar el paso 1 y las rutas en `NGINX_ACCESS_GLOB` / `NGINX_ERROR_GLOB` |
 | `fue rotado y no se encontró el archivo anterior; pueden faltar líneas` | El servicio estuvo detenido durante una rotación y el archivo ya se comprimió | Sin acción; vigilar que el servicio no quede detenido más de un día |
+| `migrar.py`: `No existe el usuario ... en PostgreSQL` | Falta el paso 2.1 o `NGINX_PG_DATABASE_USER` no coincide | Crear el usuario o pasar `--usuario` |
 | `ModuleNotFoundError` o `UndefinedValueError` | Dependencias sin instalar o falta una variable obligatoria en `.env` | Repetir `pip install` o completar `.env` |
 
 Para ver más detalle temporalmente, ejecutar a mano con el usuario del servicio:

@@ -10,7 +10,8 @@ guarda en PostgreSQL. Pensado para correr como servicio de systemd.
 - Detecta la rotación de logrotate y termina de leer el archivo anterior.
 - Si la base de datos no responde, deja de avanzar y reintenta.
 
-Las tablas se crean antes con crear_tablas.sql.
+Las tablas se crean antes con migrar.py. Al arrancar verifica que la base tenga
+la última migración que trae el código.
 
 Uso:
     python3 leer_log_nginx.py
@@ -31,6 +32,8 @@ import psycopg2
 from psycopg2.extras import execute_values
 from decouple import config, Csv
 
+from migrar import ultima_version
+
 ACCESS_GLOB = config('NGINX_ACCESS_GLOB', default='/var/log/nginx/*access*.log')
 ERROR_GLOB = config('NGINX_ERROR_GLOB', default='/var/log/nginx/*error*.log')
 LOTE = config('NGINX_LOTE', default=500, cast=int)
@@ -39,6 +42,7 @@ ESCANEO = config('NGINX_ESCANEO', default=1, cast=float)
 EXCLUIR = config('NGINX_EXCLUIR', default='')
 PARAMETROS_OCULTOS = config('NGINX_PARAMETROS_OCULTOS', default='token,password,key,secret', cast=Csv())
 SERVIDOR = config('NGINX_SERVIDOR', default='') or None
+SERVIDOR_POSICION = SERVIDOR or ''  # clave en nginx_posicion, que no admite NULL
 SSLMODE = config('NGINX_PG_SSLMODE', default='prefer')
 SSLROOTCERT = config('NGINX_PG_SSLROOTCERT', default='') or None
 
@@ -46,6 +50,8 @@ DESCUBRIMIENTO = 30        # segundos entre búsquedas de archivos nuevos
 GRACIA_ROTACION = 5        # segundos leyendo el archivo rotado antes de cambiar al nuevo
 TAMANO_LECTURA = 64 * 1024
 ESPERAS = (5, 10, 30, 60)  # reintentos de conexión
+# Errores causados por los datos de una fila; cualquier otro (esquema, permisos) no debe desviar filas
+ERRORES_DE_FILA = (psycopg2.DataError, psycopg2.IntegrityError)
 
 PATRON_EXCLUIR = re.compile(EXCLUIR) if EXCLUIR else None
 PARAMETROS_OCULTOS = [p for p in PARAMETROS_OCULTOS if p]
@@ -63,7 +69,7 @@ PATRON_CAMPOS_ERROR = re.compile(
 )
 
 SQL_ACCESO = '''
-    INSERT INTO nginx_acceso (fecha, archivo, host, ip, metodo, uri, protocolo, status, bytes,
+    INSERT INTO nginx_acceso (fecha, archivo, host, ip, metodo, ruta, parametros, protocolo, status, bytes,
                               referer, user_agent, request_time, upstream_time, upstream, servidor)
     VALUES %s
 '''
@@ -74,8 +80,8 @@ SQL_ERROR = '''
 '''
 SQL_INVALIDA = 'INSERT INTO nginx_linea_invalida (archivo, linea, motivo) VALUES %s'
 SQL_POSICION = '''
-    INSERT INTO nginx_posicion (archivo, inode, posicion) VALUES %s
-    ON CONFLICT (archivo) DO UPDATE
+    INSERT INTO nginx_posicion (servidor, archivo, inode, posicion) VALUES %s
+    ON CONFLICT (servidor, archivo) DO UPDATE
     SET inode = EXCLUDED.inode, posicion = EXCLUDED.posicion, actualizado = now()
 '''
 
@@ -147,13 +153,15 @@ def parsear_acceso(linea, archivo):
     uri = ocultar(texto(datos.get('uri')))
     if PATRON_EXCLUIR and uri and PATRON_EXCLUIR.search(uri):
         return None
+    ruta, _, parametros = (uri or '').partition('?')
     return (
         datetime.fromisoformat(datos['time']),
         archivo,
         texto(datos.get('host')),
         ip(datos.get('ip')),
         texto(datos.get('method')),
-        uri,
+        ruta or None,
+        parametros or None,
         texto(datos.get('protocol')),
         entero(datos.get('status')),
         entero(datos.get('bytes')),
@@ -266,18 +274,33 @@ class LectorNginx:
             try:
                 self.asegurar_conexion()
                 with self.conexion, self.conexion.cursor() as cursor:
-                    cursor.execute('SELECT archivo, inode, posicion FROM nginx_posicion')
+                    self.verificar_version(cursor)
+                    cursor.execute(
+                        'SELECT archivo, inode, posicion FROM nginx_posicion WHERE servidor = %s',
+                        (SERVIDOR_POSICION,),
+                    )
                     return {archivo: (int(inode), posicion) for archivo, inode, posicion in cursor.fetchall()}
             except psycopg2.errors.UndefinedTable:
-                log.error('No existen las tablas. Ejecute crear_tablas.sql en la base de datos.')
+                log.error('La base de datos no tiene las tablas. Ejecute migrar.py.')
                 sys.exit(1)
             except psycopg2.Error as e:
                 self.fallo_conexion(e, intento)
                 intento += 1
         return None
 
+    def verificar_version(self, cursor):
+        cursor.execute('SELECT coalesce(max(version), 0) FROM lantano_migracion')
+        base, codigo = cursor.fetchone()[0], ultima_version()
+        if base < codigo:
+            log.error('La base de datos está en la versión %s y el código espera la %s. Ejecute migrar.py.', base, codigo)
+            sys.exit(1)
+        if base > codigo:
+            log.error('La base de datos está en la versión %s, más nueva que el código (%s). Actualice el código.',
+                      base, codigo)
+            sys.exit(1)
+
     def guardar_posiciones(self, cursor):
-        filas = [(a.ruta, a.inode, a.posicion) for a in self.archivos.values() if a.fh]
+        filas = [(SERVIDOR_POSICION, a.ruta, a.inode, a.posicion) for a in self.archivos.values() if a.fh]
         if filas:
             execute_values(cursor, SQL_POSICION, filas)
 
@@ -292,7 +315,10 @@ class LectorNginx:
             self.guardar_posiciones(cursor)
 
     def insertar_individual(self):
-        """Inserta fila por fila; las que fallan por sus datos van a nginx_linea_invalida."""
+        """Inserta fila por fila; las que fallan por sus datos van a nginx_linea_invalida.
+
+        Otros errores se propagan y se deshace toda la transacción.
+        """
         invalidas = list(self.pendientes['invalida'])
         with self.conexion, self.conexion.cursor() as cursor:
             for tabla, sql in (('acceso', SQL_ACCESO), ('error', SQL_ERROR)):
@@ -301,9 +327,7 @@ class LectorNginx:
                     try:
                         cursor.execute(sql, (fila,))
                         cursor.execute('RELEASE SAVEPOINT fila')
-                    except (psycopg2.OperationalError, psycopg2.InterfaceError):
-                        raise
-                    except psycopg2.Error as e:
+                    except ERRORES_DE_FILA as e:
                         cursor.execute('ROLLBACK TO SAVEPOINT fila')
                         invalidas.append((fila[1], repr(fila), f'{type(e).__name__}: {str(e).strip()}'))
             if invalidas:
@@ -322,13 +346,14 @@ class LectorNginx:
                 else:
                     self.insertar_lote()
                 break
-            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                error = e
-            except psycopg2.Error as e:
+            except ERRORES_DE_FILA as e:
                 if not individual:
                     log.warning('Error al insertar el lote (%s). Se insertan las filas una por una.', str(e).strip())
                     individual = True
                     continue
+                error = e
+            except psycopg2.Error as e:
+                # Conexión, esquema o permisos: se reintenta sin avanzar la posición
                 error = e
             if self.detener:
                 log.warning('No se pudo guardar al detener; se retomará desde la última posición guardada.')
