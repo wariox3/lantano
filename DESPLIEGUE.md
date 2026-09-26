@@ -230,6 +230,17 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
 ## Actualizar
 
 ```bash
+sudo bash /root/actualizar_lantano.sh     # copia de /opt/lantano/actualizar_lantano.sh
+```
+
+El script hace `git pull`, ejecuta `migrar.py` y reinicia el servicio. Se detiene en el primer error: si falla
+antes del reinicio, el servicio sigue corriendo con la versión anterior. Si no hay cambios nuevos, no hace nada.
+No instala dependencias ni copia `lantano.service`: si cambian `requirements.txt` o `lantano.service`, aplicarlos
+con los pasos de abajo. Después, revisar el servicio con `journalctl -u lantano -n 20`.
+
+Los pasos equivalentes, a mano:
+
+```bash
 cd /opt/lantano
 sudo git log --oneline -1          # anotar el commit actual por si hay que revertir
 sudo git pull
