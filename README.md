@@ -27,6 +27,11 @@ Instalación, verificación, actualización y reversión en producción: [DESPLI
   [DESPLIEGUE.md](DESPLIEGUE.md)). Es `NULL` en los servicios que no la envían.
 - `api_key` es solo el prefijo de la cabecera `X-API-Key` (`erp_<hex>`), extraído en nginx; si llegara la llave
   completa, se descarta lo que va después del punto. Es el que envió el cliente: con `status` 401 era inválida.
+- `ip` es la IP de la conexión: en los sitios detrás de Cloudflare, el nodo de Cloudflare. `ip_real` es la IP del
+  cliente, que nginx toma de `CF-Connecting-IP` solo si la conexión viene de un rango de Cloudflare (`real_ip`, ver
+  [DESPLIEGUE.md](DESPLIEGUE.md)); en las conexiones directas es igual a `ip`. Es `NULL` en las filas anteriores al
+  cambio y en los servidores que aún tienen el `log_format` anterior. Desde ese cambio, `client` de `nginx_error`
+  también es la IP del cliente (salvo errores previos a leer la petición, como los del handshake TLS).
 - Las fechas del error log no traen zona horaria: se interpretan con la zona del servidor nginx.
 
 ## Migraciones
@@ -69,10 +74,20 @@ SELECT api_key, count(*) AS total, count(*) FILTER (WHERE status = 401) AS recha
 FROM nginx_acceso WHERE api_key IS NOT NULL AND fecha > now() - interval '24 hours'
 GROUP BY api_key ORDER BY total DESC;
 
--- IPs con más 404
+-- IPs de clientes con más 404
+SELECT ip_real, count(*) FROM nginx_acceso
+WHERE status = 404 AND ip_real IS NOT NULL AND fecha > now() - interval '24 hours'
+GROUP BY ip_real ORDER BY 2 DESC LIMIT 20;
+
+-- Actividad de una IP en la última hora (usa el índice ip_real, fecha)
+SELECT fecha, host, metodo, ruta, status, api_key FROM nginx_acceso
+WHERE ip_real = '190.1.2.3' AND fecha > now() - interval '1 hour'
+ORDER BY fecha DESC;
+
+-- Conexiones directas a un sitio detrás de Cloudflare (escáneres, o rangos de Cloudflare desactualizados)
 SELECT ip, count(*) FROM nginx_acceso
-WHERE status = 404 AND fecha > now() - interval '24 hours'
-GROUP BY ip ORDER BY 2 DESC LIMIT 20;
+WHERE host = 'api.semanticaapi.com.co' AND ip_real = ip AND fecha > now() - interval '24 hours'
+GROUP BY ip ORDER BY 2 DESC;
 
 -- Últimos errores de nginx
 SELECT fecha, nivel, server, mensaje, request FROM nginx_error ORDER BY fecha DESC LIMIT 50;

@@ -61,7 +61,8 @@ acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y
        default                          "";
    }
 
-   log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$remote_addr",'
+   log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$realip_remote_addr",'
+     '"ip_real":"$remote_addr",'
      '"method":"$request_method","uri":"$request_uri","protocol":"$server_protocol",'
      '"status":"$status","bytes":"$body_bytes_sent","referer":"$http_referer",'
      '"user_agent":"$http_user_agent","request_time":"$request_time",'
@@ -81,14 +82,60 @@ acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y
      `erp_ab12cd34.<secreto>`). **Nunca registrar `$http_x_api_key` directamente**: escribiría la llave completa en
      el log. Es el prefijo que envió el cliente, no uno validado: con `status` 401 la llave era inválida o estaba
      expirada. Lo que no tiene el formato `erp_<hex>.` queda vacío.
+   - `ip` es la IP de la conexión (`$realip_remote_addr`) e `ip_real` la del cliente (`$remote_addr`). Mientras no
+     esté configurado `real_ip` (paso 1.3), las dos son iguales: en los sitios detrás de Cloudflare, `ip_real`
+     tendría la IP de Cloudflare. **Nunca registrar `$http_cf_connecting_ip` como IP del cliente**: en una conexión
+     directa, sin pasar por Cloudflare, cualquiera puede enviar esa cabecera con la IP que quiera.
 
-3. Validar y recargar:
+3. Configurar `real_ip` para los sitios detrás de Cloudflare: nginx toma la IP del cliente de `CF-Connecting-IP`
+   solo cuando la conexión viene de un rango de Cloudflare. En una conexión directa ignora la cabecera y `ip_real` es
+   la IP de la conexión; los sitios sin Cloudflare no se ven afectados. Confirmar que nginx tiene el módulo y crear
+   `/etc/nginx/conf.d/cloudflare-realip.conf` (se incluye solo dentro de `http`):
+
+   ```bash
+   sudo nginx -V 2>&1 | grep -o with-http_realip_module    # debe mostrar el módulo
+   sudo nano /etc/nginx/conf.d/cloudflare-realip.conf
+   ```
+
+   ```nginx
+   # Rangos de https://www.cloudflare.com/ips/ (revisados 2026-09-26)
+   set_real_ip_from 173.245.48.0/20;
+   set_real_ip_from 103.21.244.0/22;
+   set_real_ip_from 103.22.200.0/22;
+   set_real_ip_from 103.31.4.0/22;
+   set_real_ip_from 141.101.64.0/18;
+   set_real_ip_from 108.162.192.0/18;
+   set_real_ip_from 190.93.240.0/20;
+   set_real_ip_from 188.114.96.0/20;
+   set_real_ip_from 197.234.240.0/22;
+   set_real_ip_from 198.41.128.0/17;
+   set_real_ip_from 162.158.0.0/15;
+   set_real_ip_from 104.16.0.0/13;
+   set_real_ip_from 104.24.0.0/14;
+   set_real_ip_from 172.64.0.0/13;
+   set_real_ip_from 131.0.72.0/22;
+   set_real_ip_from 2400:cb00::/32;
+   set_real_ip_from 2606:4700::/32;
+   set_real_ip_from 2803:f800::/32;
+   set_real_ip_from 2405:b500::/32;
+   set_real_ip_from 2405:8100::/32;
+   set_real_ip_from 2a06:98c0::/29;
+   set_real_ip_from 2c0f:f248::/32;
+   real_ip_header CF-Connecting-IP;
+   ```
+
+   - Antes de copiarlos, comparar los rangos con https://www.cloudflare.com/ips-v4 e
+     https://www.cloudflare.com/ips-v6: la lista de arriba puede estar desactualizada.
+   - Usar `CF-Connecting-IP`, no `X-Forwarded-For`: Cloudflare agrega valores a `X-Forwarded-For` en lugar de
+     reemplazarla, así que el cliente puede falsificar su primer valor.
+
+4. Validar y recargar:
 
    ```bash
    sudo nginx -t && sudo systemctl reload nginx
    ```
 
-4. Hacer una petición a cada uno de los 3 sitios y comprobar que las líneas nuevas salen en JSON:
+5. Hacer una petición a cada uno de los 3 sitios y comprobar que las líneas nuevas salen en JSON:
 
    ```bash
    sudo tail -n 3 /var/log/nginx/access.log
@@ -99,6 +146,14 @@ Mientras se use este esquema:
 - Un sitio nuevo tampoco debe declarar `access_log`: si lo hace, deja de escribir en `access.log` con formato JSON.
 - Si otra herramienta del servidor lee `access.log` en el formato por defecto (fail2ban, GoAccess, AWStats),
   deja de entenderlo.
+- Con `real_ip` (paso 1.3), `$remote_addr` es la IP del cliente en toda la configuración, no solo en el log:
+  `limit_req_zone`/`limit_conn_zone` por `$binary_remote_addr` limitan por cliente y no por nodo de Cloudflare,
+  `allow`/`deny` evalúan al cliente y los backends reciben al cliente en `X-Real-IP $remote_addr`.
+- Los rangos de Cloudflare se mantienen a mano: revisar https://www.cloudflare.com/ips/ cada cierto tiempo y, si
+  cambiaron, editar `cloudflare-realip.conf` en cada servidor, `nginx -t` y `reload`. Mientras falte un rango
+  nuevo, las peticiones que pasan por esos nodos se guardan con `ip_real` igual a la IP de Cloudflare (se detecta
+  con la consulta de conexiones directas del [README](README.md#consultas-de-ejemplo)); nunca se confía en una IP
+  que no sea de Cloudflare.
 - Al actualizar el paquete de nginx, `apt` puede preguntar si conservar el `nginx.conf` modificado: responder
   que se conserve (opción por defecto `N`).
 - Para volver al formato por defecto: `sudo cp /etc/nginx/nginx.conf.antes-lantano /etc/nginx/nginx.conf`,
@@ -218,14 +273,24 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
 
    ```sql
    SELECT servidor, archivo, posicion, actualizado FROM nginx_posicion ORDER BY actualizado DESC;
-   SELECT fecha, host, ruta, parametros, status FROM nginx_acceso ORDER BY id DESC LIMIT 5;
+   SELECT fecha, host, ip, ip_real, ruta, parametros, status FROM nginx_acceso ORDER BY id DESC LIMIT 5;
    SELECT count(*) FROM nginx_linea_invalida WHERE creado > now() - interval '1 hour';
    ```
 
    Si `nginx_linea_invalida` se llena con líneas de acceso, `access.log` sigue recibiendo el formato por defecto:
    revisar que en `nginx.conf` no quedó la línea `access_log` original (paso 1.2).
 
+   En un sitio detrás de Cloudflare, `ip` debe ser un nodo de Cloudflare e `ip_real` la IP pública de quien hizo
+   la petición.
+
 3. Probar un reinicio: `sudo systemctl restart lantano` y comprobar en el log que dice `continúa en el byte ...`.
+
+4. Probar que no se puede falsificar `ip_real`: desde otra máquina, conectarse directo al servidor con la cabecera
+   de Cloudflare. La fila debe tener `ip_real` igual a la IP de esa máquina, no `1.2.3.4`:
+
+   ```bash
+   curl -sk -o /dev/null --resolve <sitio>:443:<ip_servidor_nginx> -H 'CF-Connecting-IP: 1.2.3.4' https://<sitio>/
+   ```
 
 ## Actualizar
 
@@ -263,6 +328,36 @@ actualiza; en los demás `migrar.py` no hace nada). Los servidores que aún tien
 - Si se reinician antes de actualizarse, se detienen con `más nueva que el código`.
 
 Durante el reinicio no se pierden líneas: al arrancar continúa desde la posición guardada.
+
+### Activar `ip_real` en un servidor ya instalado
+
+Para servidores instalados antes de la migración `0004_ip_real.sql`. Mientras no se haga, `ip_real` queda en
+`NULL` en las filas de ese servidor; las filas anteriores al cambio quedan en `NULL` para siempre.
+
+1. Actualizar Lantano (`actualizar_lantano.sh`, ver arriba). Con varios servidores, en todos.
+2. Revisar qué más usa `$remote_addr` en la configuración de nginx (ver el paso 1, "Mientras se use este esquema"):
+
+   ```bash
+   sudo nginx -T 2>/dev/null | grep -nE 'remote_addr|allow |deny |limit_req_zone|limit_conn_zone|geo |X-Real-IP|X-Forwarded-For'
+   sudo nginx -V 2>&1 | grep -o with-http_realip_module
+   ```
+
+3. Crear `/etc/nginx/conf.d/cloudflare-realip.conf` como en el paso 1.3, **sin recargar** nginx: `real_ip` y el
+   nuevo `log_format` deben entrar en el mismo reload. Si se recarga solo `real_ip` con el `log_format` anterior
+   (`"ip":"$remote_addr"`), la columna `ip` pasa a guardar la IP del cliente.
+
+4. En `/etc/nginx/nginx.conf`, cambiar el inicio del `log_format` como en el paso 1.2:
+
+   ```diff
+   -log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$remote_addr",'
+   +log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$realip_remote_addr",'
+   +  '"ip_real":"$remote_addr",'
+   ```
+
+5. `sudo nginx -t && sudo systemctl reload nginx` y hacer las pruebas del paso 4 (puntos 2 y 4).
+
+Para deshacerlo: `sudo rm /etc/nginx/conf.d/cloudflare-realip.conf`, volver al
+`log_format` anterior, `nginx -t` y `reload`. Lantano sigue funcionando y guarda `ip_real` en `NULL`.
 
 ## Revertir
 
@@ -309,6 +404,7 @@ Las tablas y los datos quedan en la base de datos; borrarlos es una decisión ap
 | `No se puede abrir ...: Permission denied` | `lognginx` no está en el grupo `adm` | `sudo usermod -aG adm lognginx && sudo systemctl restart lantano` |
 | `No hay archivos que coincidan con ...` | No existen `/var/log/nginx/access.log` ni `error.log` | Revisar el paso 1 y las rutas en `NGINX_ACCESS_GLOB` / `NGINX_ERROR_GLOB` |
 | `fue rotado y no se encontró el archivo anterior; pueden faltar líneas` | El servicio estuvo detenido durante una rotación y el archivo ya se comprimió | Sin acción; vigilar que el servicio no quede detenido más de un día |
+| En un sitio detrás de Cloudflare, filas con `ip_real = ip` y una IP de Cloudflare | Falta `cloudflare-realip.conf`, se creó sin recargar nginx, o Cloudflare agregó un rango nuevo | Comparar el archivo con https://www.cloudflare.com/ips/, corregirlo, `nginx -t` y `reload` (paso 1.3) |
 | `ModuleNotFoundError` o `UndefinedValueError` | Dependencias sin instalar o falta una variable obligatoria en `.env` | Repetir `pip install` o completar `.env` |
 
 Para ver más detalle temporalmente, ejecutar a mano con el usuario del servicio:
