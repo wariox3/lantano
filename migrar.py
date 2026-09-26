@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Aplica en orden las migraciones de migraciones/ que falten en la base de datos y
-reaplica los permisos del usuario del servicio (permisos.sql).
+Aplica en orden las migraciones de migraciones/ que falten en la base de datos.
 
 - Cada migración es un archivo NNNN_descripcion.sql con SQL plano; se ejecuta en
   su propia transacción y se registra en lantano_migracion.
@@ -9,26 +8,21 @@ reaplica los permisos del usuario del servicio (permisos.sql).
 - Un bloqueo de PostgreSQL evita que dos ejecuciones simultáneas (por ejemplo,
   desde dos servidores nginx) apliquen la misma migración.
 
-Se ejecuta con un usuario administrador, no con el del servicio. Host, puerto,
-base, SSL y usuario del servicio se toman del .env si no se indican.
+Se conecta con los datos del .env, igual que el servicio; el usuario debe ser
+dueño de la base.
 
 Uso:
-    python3 migrar.py --admin <usuario_admin>
-    python3 migrar.py --admin <usuario_admin> --estado
+    python3 migrar.py
+    python3 migrar.py --estado
 """
 import argparse
-import getpass
 import os
 import re
-import sys
 
 import psycopg2
-from psycopg2 import sql
-from decouple import config
 
 DIRECTORIO = os.path.dirname(os.path.abspath(__file__))
 DIRECTORIO_MIGRACIONES = os.path.join(DIRECTORIO, 'migraciones')
-ARCHIVO_PERMISOS = os.path.join(DIRECTORIO, 'permisos.sql')
 PATRON_MIGRACION = re.compile(r'^(\d{4})_[\w-]+\.sql$')
 
 SQL_TABLA = '''
@@ -60,26 +54,6 @@ def ultima_version():
     return migraciones[-1][0] if migraciones else 0
 
 
-def conectar(argumentos):
-    parametros = dict(
-        user=argumentos.admin,
-        host=argumentos.host,
-        port=argumentos.puerto,
-        dbname=argumentos.base,
-        sslmode=argumentos.sslmode,
-        sslrootcert=argumentos.sslrootcert,
-        connect_timeout=10,
-        application_name='migrar',
-    )
-    try:
-        # Sin clave: libpq usa PGPASSWORD o ~/.pgpass si existen
-        return psycopg2.connect(**parametros)
-    except psycopg2.OperationalError as e:
-        if 'no password supplied' not in str(e) or not sys.stdin.isatty():
-            raise
-    return psycopg2.connect(password=getpass.getpass(f'Clave de {argumentos.admin}: '), **parametros)
-
-
 def aplicadas(cursor):
     cursor.execute("SELECT to_regclass('lantano_migracion') IS NOT NULL")
     if not cursor.fetchone()[0]:
@@ -98,15 +72,15 @@ def mostrar_estado(conexion):
         print(f'{version:04d} aplicada en la base pero no existe en migraciones/ (código anterior a la base)')
 
 
-def migrar(conexion, usuario):
-    with conexion.cursor() as cursor:
-        cursor.execute('SELECT 1 FROM pg_roles WHERE rolname = %s', (usuario,))
-        if not cursor.fetchone():
-            raise SystemExit(f'No existe el usuario {usuario} en PostgreSQL. Créelo antes (CREATE USER).')
-        cursor.execute(SQL_BLOQUEO)
-        cursor.execute(SQL_TABLA)
-        registradas = aplicadas(cursor)
-    conexion.commit()
+def migrar(conexion):
+    try:
+        with conexion.cursor() as cursor:
+            cursor.execute(SQL_BLOQUEO)
+            cursor.execute(SQL_TABLA)
+            registradas = aplicadas(cursor)
+        conexion.commit()
+    except psycopg2.errors.InsufficientPrivilege as e:
+        raise SystemExit(f'{str(e).strip()}\nEl usuario del .env debe ser dueño de la base (ALTER DATABASE ... OWNER TO ...).')
 
     migraciones = listar_migraciones()
     desconocidas = set(registradas) - {version for version, _ in migraciones}
@@ -128,39 +102,24 @@ def migrar(conexion, usuario):
     if not pendientes:
         print(f'La base está al día (versión {ultima_version()}).')
 
-    with open(ARCHIVO_PERMISOS, encoding='utf-8') as archivo:
-        permisos = sql.SQL(archivo.read()).format(usuario=sql.Identifier(usuario))
-    with conexion, conexion.cursor() as cursor:
-        cursor.execute(permisos)
-    print(f'Permisos aplicados a {usuario}.')
 
 
 def main():
     parser = argparse.ArgumentParser(description='Aplica las migraciones pendientes de la base de datos de Lantano.')
-    parser.add_argument('--admin', required=True, help='usuario de PostgreSQL con permisos para crear tablas')
-    parser.add_argument('--host', default=config('NGINX_PG_DATABASE_HOST', default=None))
-    parser.add_argument('--puerto', default=config('NGINX_PG_DATABASE_PORT', default='5432'))
-    parser.add_argument('--base', default=config('NGINX_PG_DATABASE_NAME', default=None))
-    parser.add_argument('--usuario', default=config('NGINX_PG_DATABASE_USER', default=None),
-                        help='usuario del servicio que recibe los permisos')
-    parser.add_argument('--sslmode', default=config('NGINX_PG_SSLMODE', default='prefer'))
-    parser.add_argument('--sslrootcert', default=config('NGINX_PG_SSLROOTCERT', default='') or None)
     parser.add_argument('--estado', action='store_true', help='muestra las migraciones aplicadas y pendientes')
     argumentos = parser.parse_args()
 
-    faltantes = [opcion for opcion in ('host', 'base', 'usuario') if not getattr(argumentos, opcion)]
-    if faltantes:
-        parser.error('faltan ' + ', '.join('--' + opcion for opcion in faltantes) + ' (no están en el .env)')
-
+    # Importación diferida: leer_log_nginx importa ultima_version de este módulo
+    from leer_log_nginx import crear_conexion
     try:
-        conexion = conectar(argumentos)
+        conexion = crear_conexion()
     except psycopg2.OperationalError as e:
         raise SystemExit(f'No se pudo conectar: {str(e).strip()}')
     try:
         if argumentos.estado:
             mostrar_estado(conexion)
         else:
-            migrar(conexion, argumentos.usuario)
+            migrar(conexion)
     finally:
         conexion.close()
 

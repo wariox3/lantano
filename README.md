@@ -34,8 +34,7 @@ faltan (registro en `lantano_migracion`). Para cambiar el esquema:
 
 1. Crear `migraciones/<siguiente número>_<descripcion>.sql` con SQL plano (sin `BEGIN`/`COMMIT` ni comandos de
    `psql`: cada archivo ya corre en su propia transacción, así que tampoco admite `CREATE INDEX CONCURRENTLY`).
-2. Si crea una tabla que usa el servicio, agregar sus permisos en `permisos.sql`.
-3. Nunca modificar una migración ya desplegada: los cambios siempre van en una nueva.
+2. Nunca modificar una migración ya desplegada: los cambios siempre van en una nueva.
 
 El servicio exige que la base esté en la última migración de su código, así que el mismo commit debe traer la
 migración y el código que la usa.

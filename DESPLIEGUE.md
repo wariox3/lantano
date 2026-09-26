@@ -12,7 +12,7 @@ servidor nginx                                   servidor de base de datos
 │              ▼                       │ ──────► │  nginx_acceso        │
 │ lantano.service (usuario lognginx)   │         │  nginx_error         │
 │ /opt/lantano/leer_log_nginx.py       │         │  nginx_posicion      │
-│ /opt/lantano/migrar.py (admin)       │         │  nginx_linea_invalida│
+│ /opt/lantano/migrar.py               │         │  nginx_linea_invalida│
 └──────────────────────────────────────┘         │  lantano_migracion   │
                                                  └──────────────────────┘
 ```
@@ -98,19 +98,18 @@ Mientras se use este esquema:
 
 *Servidor de base de datos.*
 
-1. Crear la base y el usuario del servicio (como administrador). Las tablas las crea `migrar.py` en el paso 3.4:
+1. Crear el usuario del servicio y la base, con ese usuario como dueño (como administrador). Tiene todos los
+   permisos sobre esa base y ninguno sobre las demás; las tablas las crea `migrar.py` en el paso 3.4:
 
    ```sql
-   CREATE DATABASE <base>;
    CREATE USER lognginx WITH PASSWORD '<clave>';
+   CREATE DATABASE <base> OWNER lognginx;
    ```
 
-2. Permitir la conexión en `pg_hba.conf` y recargar PostgreSQL (`sudo systemctl reload postgresql`). La segunda
-   línea es para el usuario administrador con el que se ejecuta `migrar.py` desde el servidor nginx:
+2. Permitir la conexión en `pg_hba.conf` y recargar PostgreSQL (`sudo systemctl reload postgresql`):
 
    ```
    hostssl  <base>  lognginx  <ip_servidor_nginx>/32  scram-sha-256
-   hostssl  <base>  <admin>   <ip_servidor_nginx>/32  scram-sha-256
    ```
 
    Si PostgreSQL no tiene SSL configurado, usar `host` en lugar de `hostssl` y `NGINX_PG_SSLMODE=prefer` en el
@@ -172,16 +171,13 @@ Mientras se use este esquema:
    | `NGINX_EXCLUIR` | No | vacío | Regex sobre la URI; lo que coincide no se guarda |
    | `NGINX_PARAMETROS_OCULTOS` | No | `token,password,key,secret` | Parámetros de URL cuyo valor se guarda como `***`. Basta con que el nombre contenga la palabra: `key` oculta `api_key`, `token` oculta `access_token` |
 
-4. Crear las tablas y los permisos con un usuario administrador de PostgreSQL. Toma host, base, SSL y usuario del
-   servicio del `.env`, y pide la clave del administrador (o la toma de `PGPASSWORD` / `~/.pgpass`):
+4. Crear las tablas. Usa la conexión del `.env` (usuario, clave, host, base y SSL):
 
    ```bash
-   cd /opt/lantano && sudo venv/bin/python migrar.py --admin <admin>
+   cd /opt/lantano && sudo venv/bin/python migrar.py
    ```
 
-   Debe terminar con `Aplicada 0001_inicial.sql` y `Permisos aplicados a lognginx.` El usuario del servicio queda
-   con `SELECT, INSERT` sobre `nginx_acceso`, `nginx_error` y `nginx_linea_invalida`, `SELECT, INSERT, UPDATE`
-   sobre `nginx_posicion` y `SELECT` sobre `lantano_migracion`. No puede borrar ni modificar logs ni el esquema.
+   Debe mostrar `Aplicada 0001_inicial.sql` y una línea por cada migración siguiente.
 
 5. Instalar y arrancar el servicio:
 
@@ -229,17 +225,17 @@ sudo git log --oneline -1          # anotar el commit actual por si hay que reve
 sudo git pull
 sudo venv/bin/pip install -r requirements.txt
 sudo cp lantano.service /etc/systemd/system/ && sudo systemctl daemon-reload
-sudo venv/bin/python migrar.py --admin <admin>     # aplica las migraciones pendientes; si no hay, no cambia nada
+sudo venv/bin/python migrar.py                    # aplica las migraciones pendientes; si no hay, no cambia nada
 sudo systemctl restart lantano
 journalctl -u lantano -f
 ```
 
 `migrar.py` va **antes** del reinicio: al arrancar, el servicio compara la versión de la base
 (`lantano_migracion`) con la última migración de su código y se detiene si no coinciden. Para ver qué está
-aplicado: `sudo venv/bin/python migrar.py --admin <admin> --estado`.
+aplicado: `sudo venv/bin/python migrar.py --estado`.
 
 Con varios servidores nginx en la misma base, la migración se ejecuta una sola vez (desde el primero que se
-actualiza; en los demás `migrar.py` solo reaplica permisos). Los servidores que aún tienen el código anterior:
+actualiza; en los demás `migrar.py` no hace nada). Los servidores que aún tienen el código anterior:
 
 - Si siguen corriendo y la migración cambió columnas que usan, reintentan sin avanzar ni perder líneas hasta que
   se actualicen.
@@ -288,11 +284,10 @@ Las tablas y los datos quedan en la base de datos; borrarlos es una decisión ap
 | `Error de base de datos: ... Reintento en N s.` | Sin red, `pg_hba.conf`, firewall o clave incorrecta | Probar con `psql` desde el servidor nginx (paso 2.4) |
 | `server does not support SSL, but SSL was required` | `NGINX_PG_SSLMODE=require` y PostgreSQL sin SSL | Configurar SSL en PostgreSQL o usar `NGINX_PG_SSLMODE=prefer` |
 | `root certificate file ... does not exist` o `certificate verify failed` | `verify-full` sin `NGINX_PG_SSLROOTCERT` válido o el host no coincide con el certificado | Revisar la ruta y permisos del certificado y que `NGINX_PG_DATABASE_HOST` sea el nombre del certificado |
-| `permission denied for table ...` | Permisos no otorgados al usuario del servicio | Ejecutar `migrar.py`, que reaplica `permisos.sql`; el servicio reintenta sin perder líneas |
+| `migrar.py`: `permission denied for schema public` (o `permiso denegado al esquema public`) | El usuario del `.env` no es dueño de la base | Como administrador: `ALTER DATABASE <base> OWNER TO lognginx;` y repetir `migrar.py` |
 | `No se puede abrir ...: Permission denied` | `lognginx` no está en el grupo `adm` | `sudo usermod -aG adm lognginx && sudo systemctl restart lantano` |
 | `No hay archivos que coincidan con ...` | No existen `/var/log/nginx/access.log` ni `error.log` | Revisar el paso 1 y las rutas en `NGINX_ACCESS_GLOB` / `NGINX_ERROR_GLOB` |
 | `fue rotado y no se encontró el archivo anterior; pueden faltar líneas` | El servicio estuvo detenido durante una rotación y el archivo ya se comprimió | Sin acción; vigilar que el servicio no quede detenido más de un día |
-| `migrar.py`: `No existe el usuario ... en PostgreSQL` | Falta el paso 2.1 o `NGINX_PG_DATABASE_USER` no coincide | Crear el usuario o pasar `--usuario` |
 | `ModuleNotFoundError` o `UndefinedValueError` | Dependencias sin instalar o falta una variable obligatoria en `.env` | Repetir `pip install` o completar `.env` |
 
 Para ver más detalle temporalmente, ejecutar a mano con el usuario del servicio:
