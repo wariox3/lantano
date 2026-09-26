@@ -67,17 +67,13 @@ acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y
      '"status":"$status","bytes":"$body_bytes_sent","referer":"$http_referer",'
      '"user_agent":"$http_user_agent","request_time":"$request_time",'
      '"upstream_time":"$upstream_response_time","upstream":"$upstream_addr",'
-     '"usuario":"$upstream_http_x_usuario","api_key":"$api_key_prefijo"}';
+     '"api_key":"$api_key_prefijo"}';
    access_log /var/log/nginx/access.log json_log;
    ```
 
    - `log_format` debe quedar **antes** de `access_log`; si no, `nginx -t` falla con `unknown log format`.
    - La línea `access_log` original no debe quedar: nginx escribiría cada petición dos veces en el mismo
      archivo, una en cada formato.
-   - `usuario` es la cabecera de respuesta `X-Usuario` que envía la aplicación con el usuario autenticado. Los
-     servicios que no la envían dejan el campo vacío y se guarda `NULL`; no hace falta configurar nada en ellos.
-     En los que sí la envían, agregar `proxy_hide_header X-Usuario;` en su `location` para que no llegue al
-     navegador. Un cliente no puede falsificarla: es una cabecera de la respuesta del backend, no de la petición.
    - `api_key` es el prefijo de la cabecera `X-API-Key` de la petición (`erp_ab12cd34` de
      `erp_ab12cd34.<secreto>`). **Nunca registrar `$http_x_api_key` directamente**: escribiría la llave completa en
      el log. Es el prefijo que envió el cliente, no uno validado: con `status` 401 la llave era inválida o estaba
@@ -329,10 +325,11 @@ actualiza; en los demás `migrar.py` no hace nada). Los servidores que aún tien
 
 Durante el reinicio no se pierden líneas: al arrancar continúa desde la posición guardada.
 
-### Activar `ip_real` en un servidor ya instalado
+### Activar `ip_real` y quitar `usuario` en un servidor ya instalado
 
-Para servidores instalados antes de la migración `0004_ip_real.sql`. Mientras no se haga, `ip_real` queda en
-`NULL` en las filas de ese servidor; las filas anteriores al cambio quedan en `NULL` para siempre.
+Para servidores instalados antes de las migraciones `0004_ip_real.sql` y `0005_quitar_usuario.sql`. Mientras no se
+haga, `ip_real` queda en `NULL` en las filas de ese servidor; las filas anteriores al cambio quedan en `NULL` para
+siempre. El campo `usuario` que siga llegando en el log se ignora.
 
 1. Actualizar Lantano (`actualizar_lantano.sh`, ver arriba). Con varios servidores, en todos.
 2. Revisar qué más usa `$remote_addr` en la configuración de nginx (ver el paso 1, "Mientras se use este esquema"):
@@ -346,13 +343,19 @@ Para servidores instalados antes de la migración `0004_ip_real.sql`. Mientras n
    nuevo `log_format` deben entrar en el mismo reload. Si se recarga solo `real_ip` con el `log_format` anterior
    (`"ip":"$remote_addr"`), la columna `ip` pasa a guardar la IP del cliente.
 
-4. En `/etc/nginx/nginx.conf`, cambiar el inicio del `log_format` como en el paso 1.2:
+4. En `/etc/nginx/nginx.conf`, cambiar el `log_format` como en el paso 1.2: agregar `ip_real` y quitar `usuario`:
 
    ```diff
    -log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$remote_addr",'
    +log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$realip_remote_addr",'
    +  '"ip_real":"$remote_addr",'
+      ...
+   -  '"usuario":"$upstream_http_x_usuario","api_key":"$api_key_prefijo"}';
+   +  '"api_key":"$api_key_prefijo"}';
    ```
+
+   Si algún sitio tiene `proxy_hide_header X-Usuario;`, dejarlo mientras la aplicación siga enviando esa cabecera:
+   evita que llegue al navegador.
 
 5. `sudo nginx -t && sudo systemctl reload nginx` y hacer las pruebas del paso 4 (puntos 2 y 4).
 

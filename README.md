@@ -23,8 +23,6 @@ Instalación, verificación, actualización y reversión en producción: [DESPLI
 - Filas que PostgreSQL rechaza por sus datos se guardan en `nginx_linea_invalida` sin detener el servicio.
 - La URI de cada acceso se guarda separada en `ruta` (sin query) y `parametros` (lo que va después del `?`),
   para buscar y agrupar por endpoint con igualdad en lugar de `LIKE`.
-- `usuario` viene de la cabecera `X-Usuario` que envía la aplicación (ver el `log_format` en
-  [DESPLIEGUE.md](DESPLIEGUE.md)). Es `NULL` en los servicios que no la envían.
 - `api_key` es solo el prefijo de la cabecera `X-API-Key` (`erp_<hex>`), extraído en nginx; si llegara la llave
   completa, se descarta lo que va después del punto. Es el que envió el cliente: con `status` 401 era inválida.
 - `ip` es la IP de la conexión: en los sitios detrás de Cloudflare, el nodo de Cloudflare. `ip_real` es la IP del
@@ -62,11 +60,6 @@ GROUP BY 1, 2 HAVING count(*) > 10 ORDER BY promedio DESC LIMIT 20;
 -- Un endpoint en la última hora (usa el índice ruta, fecha)
 SELECT fecha, host, parametros, status, request_time FROM nginx_acceso
 WHERE ruta = '/api/pagos' AND fecha > now() - interval '1 hour'
-ORDER BY fecha DESC;
-
--- Actividad de un usuario en las últimas 24 h
-SELECT fecha, host, metodo, ruta, status FROM nginx_acceso
-WHERE usuario = '42' AND fecha > now() - interval '24 hours'
 ORDER BY fecha DESC;
 
 -- Uso por API Key en las últimas 24 h (401 = llave inválida o expirada)
