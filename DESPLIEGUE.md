@@ -10,7 +10,7 @@ servidor nginx                                   servidor de base de datos
 │ /var/log/nginx/error.log             │         │  PostgreSQL          │
 │              │                       │  5432   │                      │
 │              ▼                       │ ──────► │  nginx_acceso        │
-│ lantano.service (usuario lognginx)   │         │  nginx_error         │
+│ lantano.service (usuario lantano)    │         │  nginx_error         │
 │ /opt/lantano/leer_log_nginx.py       │         │  nginx_posicion      │
 │ /opt/lantano/migrar.py               │         │  nginx_linea_invalida│
 └──────────────────────────────────────┘         │  lantano_migracion   │
@@ -195,7 +195,7 @@ Mientras se use este esquema:
 1. Crear el usuario del sistema. Pertenece al grupo `adm` para poder leer `/var/log/nginx`:
 
    ```bash
-   sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm lognginx
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm lantano
    ```
 
 2. Descargar el código e instalar dependencias:
@@ -211,7 +211,7 @@ Mientras se use este esquema:
    ```bash
    sudo cp /opt/lantano/.env.example /opt/lantano/.env
    sudo nano /opt/lantano/.env
-   sudo chown root:lognginx /opt/lantano/.env && sudo chmod 640 /opt/lantano/.env
+   sudo chown root:lantano /opt/lantano/.env && sudo chmod 640 /opt/lantano/.env
    ```
 
    | Variable | Obligatoria | Por defecto | Uso |
@@ -223,7 +223,7 @@ Mientras se use este esquema:
    | `NGINX_PG_DATABASE_PORT` | No | `5432` | Puerto |
    | `NGINX_SERVIDOR` | No | vacío (`NULL`) | Nombre de este servidor nginx; se guarda en la columna `servidor` de `nginx_acceso` y `nginx_error`. **Obligatoria y distinta en cada servidor** si varios escriben en la misma base: también separa sus posiciones en `nginx_posicion`. No cambiarla después sin mover sus filas de `nginx_posicion`, o el servicio arranca desde el final de los archivos |
    | `NGINX_PG_SSLMODE` | No | `prefer` | `require` exige SSL; `verify-full` además valida certificado y nombre del host. La plantilla trae `require` |
-   | `NGINX_PG_SSLROOTCERT` | No | | Ruta al certificado de la CA, necesario con `verify-ca` / `verify-full` (legible por `lognginx`) |
+   | `NGINX_PG_SSLROOTCERT` | No | | Ruta al certificado de la CA, necesario con `verify-ca` / `verify-full` (legible por `lantano`) |
    | `NGINX_ACCESS_GLOB` | No | `/var/log/nginx/*access*.log` | Archivos de acceso vigilados |
    | `NGINX_ERROR_GLOB` | No | `/var/log/nginx/*error*.log` | Archivos de error vigilados |
    | `NGINX_LOTE` | No | `500` | Filas por inserción |
@@ -387,7 +387,7 @@ solo avanzan. En ese caso hay dos opciones:
 sudo systemctl disable --now lantano
 sudo rm /etc/systemd/system/lantano.service && sudo systemctl daemon-reload
 sudo rm -rf /opt/lantano
-sudo userdel lognginx
+sudo userdel lantano
 ```
 
 Las tablas y los datos quedan en la base de datos; borrarlos es una decisión aparte.
@@ -404,7 +404,7 @@ Las tablas y los datos quedan en la base de datos; borrarlos es una decisión ap
 | `server does not support SSL, but SSL was required` | `NGINX_PG_SSLMODE=require` y PostgreSQL sin SSL | Configurar SSL en PostgreSQL o usar `NGINX_PG_SSLMODE=prefer` |
 | `root certificate file ... does not exist` o `certificate verify failed` | `verify-full` sin `NGINX_PG_SSLROOTCERT` válido o el host no coincide con el certificado | Revisar la ruta y permisos del certificado y que `NGINX_PG_DATABASE_HOST` sea el nombre del certificado |
 | `migrar.py`: `permission denied for schema public` (o `permiso denegado al esquema public`) | El usuario del `.env` no es dueño de la base | Como administrador: `ALTER DATABASE <base> OWNER TO lognginx;` y repetir `migrar.py` |
-| `No se puede abrir ...: Permission denied` | `lognginx` no está en el grupo `adm` | `sudo usermod -aG adm lognginx && sudo systemctl restart lantano` |
+| `No se puede abrir ...: Permission denied` | `lantano` no está en el grupo `adm` | `sudo usermod -aG adm lantano && sudo systemctl restart lantano` |
 | `No hay archivos que coincidan con ...` | No existen `/var/log/nginx/access.log` ni `error.log` | Revisar el paso 1 y las rutas en `NGINX_ACCESS_GLOB` / `NGINX_ERROR_GLOB` |
 | `fue rotado y no se encontró el archivo anterior; pueden faltar líneas` | El servicio estuvo detenido durante una rotación y el archivo ya se comprimió | Sin acción; vigilar que el servicio no quede detenido más de un día |
 | En un sitio detrás de Cloudflare, filas con `ip_real = ip` y una IP de Cloudflare | Falta `cloudflare-realip.conf`, se creó sin recargar nginx, o Cloudflare agregó un rango nuevo | Comparar el archivo con https://www.cloudflare.com/ips/, corregirlo, `nginx -t` y `reload` (paso 1.3) |
@@ -414,7 +414,7 @@ Para ver más detalle temporalmente, ejecutar a mano con el usuario del servicio
 
 ```bash
 sudo systemctl stop lantano
-sudo -u lognginx /opt/lantano/venv/bin/python /opt/lantano/leer_log_nginx.py --debug
+sudo -u lantano /opt/lantano/venv/bin/python /opt/lantano/leer_log_nginx.py --debug
 sudo systemctl start lantano
 ```
 
