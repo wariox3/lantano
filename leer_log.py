@@ -84,6 +84,8 @@ FORMATOS_FECHA_APACHE = ('%a %b %d %H:%M:%S.%f %Y', '%a %b %d %H:%M:%S %Y')
 # Apache escapa en el log de acceso los bytes no imprimibles o no ASCII como \xhh, que no es JSON válido.
 # Se consume cada escape completo para no confundir \\x41 (barra invertida seguida de x41) con un byte.
 PATRON_ESCAPES_APACHE = re.compile(r'(?:\\x[0-9a-fA-F]{2})+|\\v|\\.')
+# Zona horaria sin dos puntos (-0500, %z de Apache), que datetime.fromisoformat no acepta antes de Python 3.11
+PATRON_ZONA_SIN_DOS_PUNTOS = re.compile(r'([+-]\d{2})(\d{2})$')
 
 SQL_ACCESO = '''
     INSERT INTO acceso (origen, fecha, archivo, host, ip, metodo, ruta, parametros, protocolo, status, bytes,
@@ -204,7 +206,7 @@ def parsear_acceso(linea, archivo):
         request_time /= 1_000_000  # %D de Apache está en microsegundos
     return (
         ORIGEN,
-        datetime.fromisoformat(datos['time']),
+        datetime.fromisoformat(PATRON_ZONA_SIN_DOS_PUNTOS.sub(r'\1:\2', str(datos['time']))),
         archivo,
         texto(datos.get('host')),
         ip(datos.get('ip')),
@@ -310,7 +312,42 @@ def parsear_error_apache(linea, archivo):
     )
 
 
+def parsear_error_monolog(linea, archivo):
+    """Línea JSON de Monolog (Symfony) que la aplicación escribe en stderr y termina en el log de errores.
+
+    Devuelve la fila para error o lanza ValueError.
+    """
+    datos = json.loads(linea)
+    if not isinstance(datos, dict) or not datos.get('datetime') or 'message' not in datos:
+        raise ValueError('línea JSON que no es de Monolog')
+    mensaje = str(datos['message'])
+    contexto = datos.get('context')
+    excepcion = contexto.get('exception') if isinstance(contexto, dict) else None
+    if isinstance(excepcion, dict) and excepcion.get('file'):
+        mensaje += f" [{excepcion.get('class', 'excepción')} en {excepcion['file']}]"
+    return (
+        ORIGEN,
+        datetime.fromisoformat(PATRON_ZONA_SIN_DOS_PUNTOS.sub(r'\1:\2', str(datos['datetime']))),
+        archivo,
+        texto(str(datos.get('level_name') or '').lower()),
+        f"symfony.{datos['channel']}" if datos.get('channel') else 'symfony',
+        None,
+        None,
+        None,
+        ocultar(texto(mensaje)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        SERVIDOR,
+    )
+
+
 def parsear_error(linea, archivo):
+    if linea.startswith('{'):
+        return parsear_error_monolog(linea, archivo)
     if ORIGEN == 'apache':
         return parsear_error_apache(linea, archivo)
     return parsear_error_nginx(linea, archivo)

@@ -25,6 +25,10 @@ Instalación, verificación, actualización y reversión en producción: [DESPLI
 - El log de errores se lee en el formato por defecto de cada uno. En Apache se guarda el módulo (`core`, `proxy`,
   `ssl`, `php`, ...) en `modulo`, y la IP de `[client ...]` en `client`; `cid`, `server`, `request`, `upstream` y
   `host` son solo de nginx.
+- Las aplicaciones Symfony que escriben sus logs en `stderr` (Monolog en JSON) terminan en el log de errores del
+  servidor web. Esas líneas también se guardan en `error`: `nivel` es el `level_name` en minúsculas (`debug`,
+  `warning`, `critical`, ...), `modulo` es `symfony.<channel>` (`symfony.request`, `symfony.cache`, ...) y
+  `mensaje` es el `message`, más la clase y el archivo de la excepción si la hay.
 - La posición (inode + byte) de cada archivo se guarda en `posicion`, por servidor (`LANTANO_SERVIDOR`), en
   la misma transacción que los registros: tras un reinicio continúa exactamente donde iba.
 - Rotación: detecta el cambio de inode, sigue leyendo el archivo rotado 5 s y luego pasa al nuevo. Si el
@@ -41,10 +45,11 @@ Instalación, verificación, actualización y reversión en producción: [DESPLI
   la llave completa, se descarta lo que va después del punto. Es el que envió el cliente: con `status` 401 era
   inválida.
 - `ip` es la IP de la conexión: en los sitios detrás de Cloudflare, el nodo de Cloudflare. `ip_real` es la IP del
-  cliente, que el servidor web toma de `CF-Connecting-IP` solo si la conexión viene de un rango de Cloudflare
-  (`real_ip` en nginx, `mod_remoteip` en Apache, ver [DESPLIEGUE.md](DESPLIEGUE.md)); en las conexiones directas
-  es igual a `ip`. Es `NULL` en los servidores nginx que aún tienen un `log_format` sin ese campo. `client` de
-  `error` también es la IP del cliente (salvo errores previos a leer la petición, como los del handshake TLS).
+  cliente, que nginx toma de `CF-Connecting-IP` solo si la conexión viene de un rango de Cloudflare (`real_ip`,
+  ver [DESPLIEGUE.md](DESPLIEGUE.md)); en las conexiones directas es igual a `ip`. Los servidores Apache no están
+  detrás de Cloudflare: en ellos `ip_real` es siempre igual a `ip`. Es `NULL` en los servidores nginx que aún
+  tienen un `log_format` sin ese campo. `client` de `error` también es la IP del cliente (salvo errores previos a
+  leer la petición, como los del handshake TLS).
 - Las fechas del log de errores no traen zona horaria: se interpretan con la zona del servidor web.
 
 ## Desarrollo local
@@ -127,5 +132,9 @@ SELECT fecha, nivel, server, mensaje, request FROM error WHERE origen = 'nginx' 
 
 -- Últimos errores de Apache (sin los notice/info de arranque y parada)
 SELECT fecha, nivel, modulo, client, mensaje FROM error
-WHERE origen = 'apache' AND nivel NOT IN ('notice', 'info') ORDER BY fecha DESC LIMIT 50;
+WHERE origen = 'apache' AND nivel NOT IN ('notice', 'info') AND coalesce(modulo, '') NOT LIKE 'symfony.%' ORDER BY fecha DESC LIMIT 50;
+
+-- Errores de las aplicaciones Symfony (excepciones no capturadas: nivel critical, módulo symfony.request)
+SELECT fecha, servidor, nivel, modulo, mensaje FROM error
+WHERE modulo LIKE 'symfony.%' AND nivel IN ('error', 'critical', 'alert', 'emergency') ORDER BY fecha DESC LIMIT 50;
 ```

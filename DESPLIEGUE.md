@@ -27,7 +27,7 @@ máquinas.
 
 | Requisito | Dónde | Detalle |
 | --- | --- | --- |
-| Python 3 con `venv` | Servidor web | Probado con 3.12 (`sudo apt install python3-venv`); mínimo 3.11 |
+| Python 3 con `venv` | Servidor web | Probado con 3.12 (`sudo apt install python3-venv`); mínimo 3.10 |
 | git | Servidor web | Acceso a `https://github.com/wariox3/lantano.git` |
 | `psql` (postgresql-client) | Servidor web | Para probar la conexión |
 | nginx o Apache 2.4 + logrotate | Servidor web | Con `delaycompress` (valor por defecto en Ubuntu para los dos) |
@@ -167,30 +167,28 @@ Mientras se use este esquema:
 ### 1B: Apache
 
 Toda la configuración de Lantano va en un solo archivo, `/etc/apache2/conf-available/lantano.conf`, con el
-contenido de [lantano-apache.conf](lantano-apache.conf) del repositorio: el formato `json_log`, el prefijo de la
-API Key y `mod_remoteip` con los rangos de Cloudflare. Los sitios escriben en `/var/log/apache2/access.log` con
-ese formato; los errores quedan en `/var/log/apache2/error.log` con el formato por defecto.
+contenido de [lantano-apache.conf](lantano-apache.conf) del repositorio: el formato `json_log` y el prefijo de la
+API Key. Los sitios escriben en `/var/log/apache2/access.log` con ese formato; los errores quedan en
+`/var/log/apache2/error.log` con el formato por defecto. Los servidores Apache no están detrás de Cloudflare: no se
+configura `mod_remoteip` y `ip_real` es igual a `ip`.
 
 1. Revisar dónde se declaran logs y si hay un `ErrorLogFormat` propio (el lector solo entiende el formato de
    error por defecto de Apache 2.4):
 
    ```bash
-   sudo grep -rnE 'CustomLog|ErrorLog|ErrorLogFormat' /etc/apache2/apache2.conf /etc/apache2/sites-enabled/ /etc/apache2/conf-enabled/
+   sudo grep -RnE 'CustomLog|ErrorLog|ErrorLogFormat' /etc/apache2/apache2.conf /etc/apache2/sites-enabled/ /etc/apache2/conf-enabled/
    ```
 
-2. Activar `mod_remoteip` (`mod_setenvif` viene activo en Ubuntu) y desactivar `other-vhosts-access-log`, que
+2. Confirmar que `mod_setenvif` está activo (viene así en Ubuntu) y desactivar `other-vhosts-access-log`, que
    escribe en `/var/log/apache2/other_vhosts_access.log` en otro formato y ese archivo también coincide con el
-   patrón `*access*.log` que vigila Lantano:
+   patrón `*access*.log` que vigila Lantano (si ya estaba desactivado, `a2disconf` solo lo informa):
 
    ```bash
-   sudo a2enmod remoteip
+   sudo apache2ctl -M | grep setenvif     # debe aparecer setenvif_module
    sudo a2disconf other-vhosts-access-log
-   sudo apache2ctl -M | grep -E 'remoteip|setenvif'    # deben aparecer los dos
    ```
 
-3. Crear `/etc/apache2/conf-available/lantano.conf` con el contenido de `lantano-apache.conf` y activarlo. Antes
-   de guardarlo, comparar los rangos de Cloudflare con https://www.cloudflare.com/ips-v4 e
-   https://www.cloudflare.com/ips-v6:
+3. Crear `/etc/apache2/conf-available/lantano.conf` con el contenido de `lantano-apache.conf` y activarlo:
 
    ```bash
    sudo nano /etc/apache2/conf-available/lantano.conf
@@ -213,20 +211,27 @@ ese formato; los errores quedan en `/var/log/apache2/error.log` con el formato p
    ```
 
    - Un sitio sin `CustomLog` usa el de `lantano.conf`, que ya escribe en `access.log` con `json_log`.
+   - Si `apache2.conf` tiene un `CustomLog` global activo (por ejemplo `CustomLog ${APACHE_LOG_DIR}/access.log
+     combined_parsable`), comentarlo, respaldando antes (`sudo cp /etc/apache2/apache2.conf
+     /etc/apache2/apache2.conf.antes-lantano`): junto con el de `lantano.conf`, cada petición se escribiría dos
+     veces en `access.log`, una en cada formato. Si otra herramienta necesita ese formato, cambiarlo a un archivo
+     cuyo nombre no contenga `access` en lugar de comentarlo.
    - Un sitio puede seguir escribiendo en su propio archivo siempre que use `json_log` y el nombre coincida con
      `*access*.log` (por ejemplo `${APACHE_LOG_DIR}/misitio_access.log`); si no, sus peticiones no se guardan o
      llegan a `linea_invalida`.
    - Un sitio no debe tener dos `CustomLog` al mismo archivo: cada petición se escribiría dos veces.
    - `api_key` es el prefijo de la cabecera `X-API-Key` (`SetEnvIf` en `lantano.conf`). **Nunca registrar
      `%{X-API-Key}i` directamente**: escribiría la llave completa en el log.
-   - `ip` es la IP de la conexión (`%{c}a`) e `ip_real` la del cliente (`%a`, después de `mod_remoteip`). **Nunca
-     registrar `%{CF-Connecting-IP}i` como IP del cliente**: en una conexión directa cualquiera puede enviarla.
-     Usar `CF-Connecting-IP` y no `X-Forwarded-For`, por la misma razón que en nginx.
+   - `ip` (`%{c}a`) e `ip_real` (`%a`) son la IP de la conexión, que sin proxy delante es la del cliente. **Nunca
+     registrar `%{CF-Connecting-IP}i` ni `%{X-Forwarded-For}i` como IP del cliente**: cualquiera puede enviar esas
+     cabeceras con la IP que quiera. Si algún día un sitio Apache pasa detrás de Cloudflare, se configura
+     `mod_remoteip` con los rangos de Cloudflare (`RemoteIPHeader CF-Connecting-IP` y un `RemoteIPTrustedProxy` por
+     rango), igual que `real_ip` en nginx.
 
-5. Validar y reiniciar (reinicio y no `reload`, porque se activó un módulo):
+5. Validar y recargar:
 
    ```bash
-   sudo apache2ctl configtest && sudo systemctl restart apache2
+   sudo apache2ctl configtest && sudo systemctl reload apache2
    ```
 
 6. Hacer una petición a cada sitio y comprobar que las líneas nuevas salen en JSON:
@@ -239,13 +244,9 @@ Mientras se use este esquema:
 
 - Un sitio nuevo debe declarar su `CustomLog` con `json_log` (o no declararlo).
 - Si otra herramienta lee `access.log` en formato `combined` (fail2ban, GoAccess, AWStats), deja de entenderlo.
-- Con `mod_remoteip`, `%a` es la IP del cliente en toda la configuración, no solo en el log: `Require ip`,
-  `mod_evasive` y las aplicaciones (`REMOTE_ADDR` en PHP) ven al cliente y no al nodo de Cloudflare.
-- Los rangos de Cloudflare se mantienen a mano en `lantano.conf`, igual que en nginx: si cambian, editar el
-  archivo en cada servidor, `apache2ctl configtest` y `systemctl reload apache2`.
 - Para volver al formato por defecto: `sudo a2disconf lantano`, restaurar los sitios desde
-  `/etc/apache2/sites-available.antes-lantano`, `sudo a2enconf other-vhosts-access-log`, `apache2ctl configtest` y
-  `systemctl reload apache2`.
+  `/etc/apache2/sites-available.antes-lantano` (y `apache2.conf` desde `apache2.conf.antes-lantano`, si se
+  modificó), `sudo a2enconf other-vhosts-access-log`, `apache2ctl configtest` y `systemctl reload apache2`.
 
 ## Paso 2: base de datos
 
@@ -288,8 +289,12 @@ Mientras se use este esquema:
 1. Crear el usuario del sistema. Pertenece al grupo `adm` para poder leer `/var/log/nginx` o `/var/log/apache2`:
 
    ```bash
-   sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm lantano
+   sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --groups adm lantano
    ```
+
+   El home `/nonexistent` es necesario: con SSL, libpq busca un certificado de cliente en `~/.postgresql/`, y si el
+   home está bajo `/home`, que el servicio no puede leer (`ProtectHome=true`), la conexión falla con
+   `Permission denied`.
 
 2. Descargar el código e instalar dependencias:
 
@@ -373,8 +378,8 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
    con nginx, revisar que en `nginx.conf` no quedó la línea `access_log` original (paso 1A.2); con Apache, que
    todos los `CustomLog` usan `json_log` y que `other-vhosts-access-log` está desactivado (pasos 1B.2 y 1B.4).
 
-   En un sitio detrás de Cloudflare, `ip` debe ser un nodo de Cloudflare e `ip_real` la IP pública de quien hizo
-   la petición.
+   En un sitio nginx detrás de Cloudflare, `ip` debe ser un nodo de Cloudflare e `ip_real` la IP pública de quien
+   hizo la petición. En Apache, `ip` e `ip_real` son iguales.
 
 3. Probar un reinicio: `sudo systemctl restart lantano` y comprobar en el log que dice `continúa en el byte ...`.
 
@@ -421,6 +426,15 @@ para este paso (fallaría en `migrar.py` por las variables del `.env`); hacerlo 
    sudo venv/bin/python migrar.py
    sudo cp lantano.service /etc/systemd/system/ && sudo systemctl daemon-reload
    sudo systemctl start lantano
+   ```
+
+   Si el servicio corría con el usuario del sistema `lognginx` (`id lognginx`), crear `lantano` antes del `start`,
+   o systemd falla con `status=217/USER`, y borrar `lognginx` cuando el servicio esté funcionando:
+
+   ```bash
+   sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --groups adm lantano
+   sudo chown root:lantano /opt/lantano/.env && sudo chmod 640 /opt/lantano/.env
+   sudo userdel lognginx     # después de verificar
    ```
 
 4. Hacer la [verificación](#paso-4-verificación).
@@ -503,6 +517,8 @@ aparte (ver "Para volver al formato por defecto" en el paso 1).
 
 | Síntoma en `journalctl -u lantano` | Causa | Solución |
 | --- | --- | --- |
+| `systemctl status lantano`: `status=217/USER` | No existe el usuario del sistema `lantano` (servidores instalados con `lognginx`) | Crearlo y darle el `.env` (paso 3.1 y 3.3) |
+| `could not open certificate file "/home/lantano/.postgresql/postgresql.crt": Permission denied` | El usuario `lantano` tiene el home bajo `/home`, que el servicio no puede leer (`ProtectHome=true`) | `sudo usermod -d /nonexistent lantano && sudo systemctl restart lantano` |
 | `UndefinedValueError: LANTANO_PG_DATABASE_USER not found` | `.env` con los nombres anteriores (`NGINX_*`) o sin completar | `sudo sed -i 's/^NGINX_/LANTANO_/' /opt/lantano/.env` y completar lo que falte (paso 3.3) |
 | `LANTANO_ORIGEN debe ser nginx o apache` | Valor mal escrito en `.env` | Corregirlo y reiniciar |
 | `La base de datos no tiene las tablas. Ejecute migrar.py.` y el servicio se reinicia cada 10 s | Falta el paso 3.4 o se apunta a otra base | Ejecutar `migrar.py` (usa la base de `LANTANO_PG_DATABASE_NAME`) |
@@ -518,7 +534,7 @@ aparte (ver "Para volver al formato por defecto" en el paso 1).
 | `fue rotado y no se encontró el archivo anterior; pueden faltar líneas` | El servicio estuvo detenido durante una rotación y el archivo ya se comprimió | Sin acción; vigilar que el servicio no quede detenido más de un día |
 | `linea_invalida` con `formato de error de Apache no reconocido` | `ErrorLogFormat` personalizado en Apache | Quitarlo para usar el formato por defecto (paso 1B.1) |
 | `linea_invalida` con líneas de acceso en formato `combined` (Apache) | Un sitio con `CustomLog ... combined` o `other-vhosts-access-log` activo | Pasos 1B.2 y 1B.4 |
-| En un sitio detrás de Cloudflare, filas con `ip_real = ip` y una IP de Cloudflare | Falta la configuración de IP real (`cloudflare-realip.conf` en nginx, `lantano.conf` + `mod_remoteip` en Apache), no se recargó el servidor web, o Cloudflare agregó un rango nuevo | Comparar los rangos con https://www.cloudflare.com/ips/, corregirlos y recargar (paso 1A.3 o 1B.3) |
+| En un sitio detrás de Cloudflare, filas con `ip_real = ip` y una IP de Cloudflare | Falta `cloudflare-realip.conf` en nginx, se creó sin recargar nginx, o Cloudflare agregó un rango nuevo | Comparar los rangos con https://www.cloudflare.com/ips/, corregirlos, `nginx -t` y `reload` (paso 1A.3) |
 | `ModuleNotFoundError` o `UndefinedValueError` | Dependencias sin instalar o falta una variable obligatoria en `.env` | Repetir `pip install` o completar `.env` |
 
 Para ver más detalle temporalmente, ejecutar a mano con el usuario del servicio:
