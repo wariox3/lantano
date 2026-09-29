@@ -1,44 +1,52 @@
 # Despliegue en producción
 
-Guía para instalar, verificar, actualizar y revertir Lantano en producción. El funcionamiento interno y las
-consultas de ejemplo están en el [README](README.md).
+Guía para instalar, verificar, actualizar y revertir Lantano en producción, con nginx o con Apache. El
+funcionamiento interno y las consultas de ejemplo están en el [README](README.md).
 
 ```
-servidor nginx                                   servidor de base de datos
-┌──────────────────────────────────────┐         ┌──────────────────────┐
-│ /var/log/nginx/access.log (JSON)     │         │                      │
-│ /var/log/nginx/error.log             │         │  PostgreSQL          │
-│              │                       │  5432   │                      │
-│              ▼                       │ ──────► │  nginx_acceso        │
-│ lantano.service (usuario lantano)    │         │  nginx_error         │
-│ /opt/lantano/leer_log_nginx.py       │         │  nginx_posicion      │
-│ /opt/lantano/migrar.py               │         │  nginx_linea_invalida│
-└──────────────────────────────────────┘         │  lantano_migracion   │
-                                                 └──────────────────────┘
+servidor web (nginx o Apache)                         servidor de base de datos
+┌───────────────────────────────────────────┐         ┌──────────────────────┐
+│ nginx:  /var/log/nginx/access.log (JSON)  │         │                      │
+│         /var/log/nginx/error.log          │         │  PostgreSQL          │
+│ Apache: /var/log/apache2/access.log (JSON)│         │  base bdlantano      │
+│         /var/log/apache2/error.log        │  5432   │  usuario lantano     │
+│                  │                        │ ──────► │                      │
+│                  ▼                        │         │  acceso              │
+│ lantano.service (usuario lantano)         │         │  error               │
+│ /opt/lantano/leer_log.py                  │         │  posicion            │
+│ /opt/lantano/migrar.py                    │         │  linea_invalida      │
+└───────────────────────────────────────────┘         │  lantano_migracion   │
+                                                      └──────────────────────┘
 ```
+
+Cada servidor web tiene su propio servicio `lantano` con `LANTANO_ORIGEN=nginx` o `LANTANO_ORIGEN=apache`, y
+todos pueden escribir en la misma base: la columna `origen` distingue los registros y `servidor` distingue las
+máquinas.
 
 ## Requisitos
 
 | Requisito | Dónde | Detalle |
 | --- | --- | --- |
-| Python 3 con `venv` | Servidor nginx | Probado con 3.12 (`sudo apt install python3-venv`) |
-| git | Servidor nginx | Acceso a `https://github.com/wariox3/lantano.git` |
-| `psql` (postgresql-client) | Servidor nginx | Para probar la conexión |
-| nginx + logrotate | Servidor nginx | Con `delaycompress` (valor por defecto en Ubuntu) |
+| Python 3 con `venv` | Servidor web | Probado con 3.12 (`sudo apt install python3-venv`); mínimo 3.11 |
+| git | Servidor web | Acceso a `https://github.com/wariox3/lantano.git` |
+| `psql` (postgresql-client) | Servidor web | Para probar la conexión |
+| nginx o Apache 2.4 + logrotate | Servidor web | Con `delaycompress` (valor por defecto en Ubuntu para los dos) |
 | PostgreSQL | Servidor de base de datos | Un usuario que pueda crear bases, usuarios y tablas |
-| Red | Ambos | Puerto 5432 abierto solo desde la IP del servidor nginx |
+| Red | Ambos | Puerto 5432 abierto solo desde la IP de cada servidor web |
 | sudo | Ambos | Para crear usuarios, archivos en `/etc` y servicios |
 
-El orden importa: **nginx → base de datos → servicio**. Si el servicio arranca antes de cambiar el formato de
-nginx, las líneas de acceso que no son JSON terminan en `nginx_linea_invalida`.
+El orden importa: **servidor web → base de datos → servicio**. Si el servicio arranca antes de cambiar el formato
+del log de acceso, las líneas que no son JSON terminan en `linea_invalida`.
 
-## Paso 1: formato JSON en nginx
+## Paso 1: formato JSON en el servidor web
 
-*Servidor nginx.*
+*Servidor web.* Seguir **1A** en los servidores con nginx y **1B** en los servidores con Apache.
+
+### 1A: nginx
 
 Los sitios no declaran `access_log` ni `error_log`: todos heredan los de `/etc/nginx/nginx.conf` y escriben en
 `/var/log/nginx/access.log` y `/var/log/nginx/error.log`. Se mantiene así y solo se cambia el formato del log de
-acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y `nginx_error`.
+acceso a JSON. Cada sitio se distingue por la columna `host` de `acceso` y `error`.
 
 1. Confirmar que ningún sitio declara su propio `access_log` (solo deben aparecer las líneas de `nginx.conf`):
 
@@ -79,14 +87,15 @@ acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y
      el log. Es el prefijo que envió el cliente, no uno validado: con `status` 401 la llave era inválida o estaba
      expirada. Lo que no tiene el formato `erp_<hex>.` queda vacío.
    - `ip` es la IP de la conexión (`$realip_remote_addr`) e `ip_real` la del cliente (`$remote_addr`). Mientras no
-     esté configurado `real_ip` (paso 1.3), las dos son iguales: en los sitios detrás de Cloudflare, `ip_real`
+     esté configurado `real_ip` (paso 1A.3), las dos son iguales: en los sitios detrás de Cloudflare, `ip_real`
      tendría la IP de Cloudflare. **Nunca registrar `$http_cf_connecting_ip` como IP del cliente**: en una conexión
      directa, sin pasar por Cloudflare, cualquiera puede enviar esa cabecera con la IP que quiera.
 
 3. Configurar `real_ip` para los sitios detrás de Cloudflare: nginx toma la IP del cliente de `CF-Connecting-IP`
    solo cuando la conexión viene de un rango de Cloudflare. En una conexión directa ignora la cabecera y `ip_real` es
    la IP de la conexión; los sitios sin Cloudflare no se ven afectados. Confirmar que nginx tiene el módulo y crear
-   `/etc/nginx/conf.d/cloudflare-realip.conf` (se incluye solo dentro de `http`):
+   `/etc/nginx/conf.d/cloudflare-realip.conf` con el contenido de
+   [cloudflare-realip-nginx.conf](cloudflare-realip-nginx.conf) del repositorio (se incluye solo dentro de `http`):
 
    ```bash
    sudo nginx -V 2>&1 | grep -o with-http_realip_module    # debe mostrar el módulo
@@ -131,7 +140,7 @@ acceso a JSON. Cada sitio se distingue por la columna `host` de `nginx_acceso` y
    sudo nginx -t && sudo systemctl reload nginx
    ```
 
-5. Hacer una petición a cada uno de los 3 sitios y comprobar que las líneas nuevas salen en JSON:
+5. Hacer una petición a cada sitio y comprobar que las líneas nuevas salen en JSON:
 
    ```bash
    sudo tail -n 3 /var/log/nginx/access.log
@@ -142,7 +151,7 @@ Mientras se use este esquema:
 - Un sitio nuevo tampoco debe declarar `access_log`: si lo hace, deja de escribir en `access.log` con formato JSON.
 - Si otra herramienta del servidor lee `access.log` en el formato por defecto (fail2ban, GoAccess, AWStats),
   deja de entenderlo.
-- Con `real_ip` (paso 1.3), `$remote_addr` es la IP del cliente en toda la configuración, no solo en el log:
+- Con `real_ip` (paso 1A.3), `$remote_addr` es la IP del cliente en toda la configuración, no solo en el log:
   `limit_req_zone`/`limit_conn_zone` por `$binary_remote_addr` limitan por cliente y no por nodo de Cloudflare,
   `allow`/`deny` evalúan al cliente y los backends reciben al cliente en `X-Real-IP $remote_addr`.
 - Los rangos de Cloudflare se mantienen a mano: revisar https://www.cloudflare.com/ips/ cada cierto tiempo y, si
@@ -153,46 +162,130 @@ Mientras se use este esquema:
 - Al actualizar el paquete de nginx, `apt` puede preguntar si conservar el `nginx.conf` modificado: responder
   que se conserve (opción por defecto `N`).
 - Para volver al formato por defecto: `sudo cp /etc/nginx/nginx.conf.antes-lantano /etc/nginx/nginx.conf`,
-  `nginx -t` y `reload`.
+  `sudo rm /etc/nginx/conf.d/cloudflare-realip.conf`, `nginx -t` y `reload`.
+
+### 1B: Apache
+
+Toda la configuración de Lantano va en un solo archivo, `/etc/apache2/conf-available/lantano.conf`, con el
+contenido de [lantano-apache.conf](lantano-apache.conf) del repositorio: el formato `json_log`, el prefijo de la
+API Key y `mod_remoteip` con los rangos de Cloudflare. Los sitios escriben en `/var/log/apache2/access.log` con
+ese formato; los errores quedan en `/var/log/apache2/error.log` con el formato por defecto.
+
+1. Revisar dónde se declaran logs y si hay un `ErrorLogFormat` propio (el lector solo entiende el formato de
+   error por defecto de Apache 2.4):
+
+   ```bash
+   sudo grep -rnE 'CustomLog|ErrorLog|ErrorLogFormat' /etc/apache2/apache2.conf /etc/apache2/sites-enabled/ /etc/apache2/conf-enabled/
+   ```
+
+2. Activar `mod_remoteip` (`mod_setenvif` viene activo en Ubuntu) y desactivar `other-vhosts-access-log`, que
+   escribe en `/var/log/apache2/other_vhosts_access.log` en otro formato y ese archivo también coincide con el
+   patrón `*access*.log` que vigila Lantano:
+
+   ```bash
+   sudo a2enmod remoteip
+   sudo a2disconf other-vhosts-access-log
+   sudo apache2ctl -M | grep -E 'remoteip|setenvif'    # deben aparecer los dos
+   ```
+
+3. Crear `/etc/apache2/conf-available/lantano.conf` con el contenido de `lantano-apache.conf` y activarlo. Antes
+   de guardarlo, comparar los rangos de Cloudflare con https://www.cloudflare.com/ips-v4 e
+   https://www.cloudflare.com/ips-v6:
+
+   ```bash
+   sudo nano /etc/apache2/conf-available/lantano.conf
+   sudo a2enconf lantano
+   ```
+
+4. En cada sitio (`/etc/apache2/sites-enabled/*.conf`, también los `-ssl`) cambiar el formato de su `CustomLog` a
+   `json_log`, respaldando antes:
+
+   ```bash
+   sudo cp -a /etc/apache2/sites-available /etc/apache2/sites-available.antes-lantano
+   sudo nano /etc/apache2/sites-available/<sitio>.conf
+   ```
+
+   ```apache
+   # Antes
+   CustomLog ${APACHE_LOG_DIR}/access.log combined
+   # Después
+   CustomLog ${APACHE_LOG_DIR}/access.log json_log
+   ```
+
+   - Un sitio sin `CustomLog` usa el de `lantano.conf`, que ya escribe en `access.log` con `json_log`.
+   - Un sitio puede seguir escribiendo en su propio archivo siempre que use `json_log` y el nombre coincida con
+     `*access*.log` (por ejemplo `${APACHE_LOG_DIR}/misitio_access.log`); si no, sus peticiones no se guardan o
+     llegan a `linea_invalida`.
+   - Un sitio no debe tener dos `CustomLog` al mismo archivo: cada petición se escribiría dos veces.
+   - `api_key` es el prefijo de la cabecera `X-API-Key` (`SetEnvIf` en `lantano.conf`). **Nunca registrar
+     `%{X-API-Key}i` directamente**: escribiría la llave completa en el log.
+   - `ip` es la IP de la conexión (`%{c}a`) e `ip_real` la del cliente (`%a`, después de `mod_remoteip`). **Nunca
+     registrar `%{CF-Connecting-IP}i` como IP del cliente**: en una conexión directa cualquiera puede enviarla.
+     Usar `CF-Connecting-IP` y no `X-Forwarded-For`, por la misma razón que en nginx.
+
+5. Validar y reiniciar (reinicio y no `reload`, porque se activó un módulo):
+
+   ```bash
+   sudo apache2ctl configtest && sudo systemctl restart apache2
+   ```
+
+6. Hacer una petición a cada sitio y comprobar que las líneas nuevas salen en JSON:
+
+   ```bash
+   sudo tail -n 3 /var/log/apache2/access.log
+   ```
+
+Mientras se use este esquema:
+
+- Un sitio nuevo debe declarar su `CustomLog` con `json_log` (o no declararlo).
+- Si otra herramienta lee `access.log` en formato `combined` (fail2ban, GoAccess, AWStats), deja de entenderlo.
+- Con `mod_remoteip`, `%a` es la IP del cliente en toda la configuración, no solo en el log: `Require ip`,
+  `mod_evasive` y las aplicaciones (`REMOTE_ADDR` en PHP) ven al cliente y no al nodo de Cloudflare.
+- Los rangos de Cloudflare se mantienen a mano en `lantano.conf`, igual que en nginx: si cambian, editar el
+  archivo en cada servidor, `apache2ctl configtest` y `systemctl reload apache2`.
+- Para volver al formato por defecto: `sudo a2disconf lantano`, restaurar los sitios desde
+  `/etc/apache2/sites-available.antes-lantano`, `sudo a2enconf other-vhosts-access-log`, `apache2ctl configtest` y
+  `systemctl reload apache2`.
 
 ## Paso 2: base de datos
 
-*Servidor de base de datos.*
+*Servidor de base de datos.* Se hace una sola vez, aunque haya varios servidores web.
 
-1. Crear el usuario del servicio y la base, con ese usuario como dueño (como administrador). Tiene todos los
-   permisos sobre esa base y ninguno sobre las demás; las tablas las crea `migrar.py` en el paso 3.4:
+1. Crear el usuario `lantano` y la base `bdlantano`, con ese usuario como dueño (como administrador). Tiene todos
+   los permisos sobre esa base y ninguno sobre las demás; las tablas las crea `migrar.py` en el paso 3.4:
 
    ```sql
-   CREATE USER lognginx WITH PASSWORD '<clave>';
-   CREATE DATABASE <base> OWNER lognginx;
+   CREATE USER lantano WITH PASSWORD '<clave>';
+   CREATE DATABASE bdlantano OWNER lantano;
    ```
 
-2. Permitir la conexión en `pg_hba.conf` y recargar PostgreSQL (`sudo systemctl reload postgresql`):
+2. Permitir la conexión desde cada servidor web en `pg_hba.conf` y recargar PostgreSQL
+   (`sudo systemctl reload postgresql`):
 
    ```
-   hostssl  <base>  lognginx  <ip_servidor_nginx>/32  scram-sha-256
+   hostssl  bdlantano  lantano  <ip_servidor_web>/32  scram-sha-256
    ```
 
-   Si PostgreSQL no tiene SSL configurado, usar `host` en lugar de `hostssl` y `NGINX_PG_SSLMODE=prefer` en el
+   Si PostgreSQL no tiene SSL configurado, usar `host` en lugar de `hostssl` y `LANTANO_PG_SSLMODE=prefer` en el
    `.env` del paso 3.3 (la conexión viaja sin cifrar).
 
-3. Abrir el puerto 5432 en el firewall solo para la IP del servidor nginx. Con ufw:
+3. Abrir el puerto 5432 en el firewall solo para la IP de cada servidor web. Con ufw:
 
    ```bash
-   sudo ufw allow from <ip_servidor_nginx> to any port 5432 proto tcp
+   sudo ufw allow from <ip_servidor_web> to any port 5432 proto tcp
    ```
 
-4. Desde el **servidor nginx**, probar la conexión:
+4. Desde el **servidor web**, probar la conexión:
 
    ```bash
-   psql "host=<host> dbname=<base> user=lognginx" -c 'SELECT 1;'
+   psql "host=<host> dbname=bdlantano user=lantano" -c 'SELECT 1;'
    ```
 
 ## Paso 3: instalación del servicio
 
-*Servidor nginx.*
+*Servidor web.*
 
-1. Crear el usuario del sistema. Pertenece al grupo `adm` para poder leer `/var/log/nginx`:
+1. Crear el usuario del sistema. Pertenece al grupo `adm` para poder leer `/var/log/nginx` o `/var/log/apache2`:
 
    ```bash
    sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm lantano
@@ -206,7 +299,7 @@ Mientras se use este esquema:
    sudo /opt/lantano/venv/bin/pip install -r /opt/lantano/requirements.txt
    ```
 
-3. Configurar `.env` a partir de la plantilla y completar los datos de conexión:
+3. Configurar `.env` a partir de la plantilla, con `LANTANO_ORIGEN` según el servidor web y los datos de conexión:
 
    ```bash
    sudo cp /opt/lantano/.env.example /opt/lantano/.env
@@ -216,29 +309,31 @@ Mientras se use este esquema:
 
    | Variable | Obligatoria | Por defecto | Uso |
    | --- | --- | --- | --- |
-   | `NGINX_PG_DATABASE_USER` | Sí | | Usuario de PostgreSQL |
-   | `NGINX_PG_DATABASE_CLAVE` | Sí | | Clave |
-   | `NGINX_PG_DATABASE_HOST` | Sí | | Host del servidor de base de datos |
-   | `NGINX_PG_DATABASE_NAME` | Sí | | Nombre de la base |
-   | `NGINX_PG_DATABASE_PORT` | No | `5432` | Puerto |
-   | `NGINX_SERVIDOR` | No | vacío (`NULL`) | Nombre de este servidor nginx; se guarda en la columna `servidor` de `nginx_acceso` y `nginx_error`. **Obligatoria y distinta en cada servidor** si varios escriben en la misma base: también separa sus posiciones en `nginx_posicion`. No cambiarla después sin mover sus filas de `nginx_posicion`, o el servicio arranca desde el final de los archivos |
-   | `NGINX_PG_SSLMODE` | No | `prefer` | `require` exige SSL; `verify-full` además valida certificado y nombre del host. La plantilla trae `require` |
-   | `NGINX_PG_SSLROOTCERT` | No | | Ruta al certificado de la CA, necesario con `verify-ca` / `verify-full` (legible por `lantano`) |
-   | `NGINX_ACCESS_GLOB` | No | `/var/log/nginx/*access*.log` | Archivos de acceso vigilados |
-   | `NGINX_ERROR_GLOB` | No | `/var/log/nginx/*error*.log` | Archivos de error vigilados |
-   | `NGINX_LOTE` | No | `500` | Filas por inserción |
-   | `NGINX_INTERVALO` | No | `5` | Segundos máximos entre guardados |
-   | `NGINX_ESCANEO` | No | `1` | Segundos de espera cuando no hay líneas nuevas |
-   | `NGINX_EXCLUIR` | No | vacío | Regex sobre la URI; lo que coincide no se guarda |
-   | `NGINX_PARAMETROS_OCULTOS` | No | `token,password,key,secret` | Parámetros de URL cuyo valor se guarda como `***`. Basta con que el nombre contenga la palabra: `key` oculta `api_key`, `token` oculta `access_token` |
+   | `LANTANO_ORIGEN` | Sí | `nginx` | `nginx` o `apache`: formato del log de errores, rutas por defecto y valor de la columna `origen`. El servicio no arranca con otro valor |
+   | `LANTANO_PG_DATABASE_USER` | Sí | | Usuario de PostgreSQL: `lantano` |
+   | `LANTANO_PG_DATABASE_CLAVE` | Sí | | Clave |
+   | `LANTANO_PG_DATABASE_HOST` | Sí | | Host del servidor de base de datos |
+   | `LANTANO_PG_DATABASE_NAME` | Sí | | Nombre de la base: `bdlantano` |
+   | `LANTANO_PG_DATABASE_PORT` | No | `5432` | Puerto |
+   | `LANTANO_SERVIDOR` | No | vacío (`NULL`) | Nombre de este servidor; se guarda en la columna `servidor` de `acceso` y `error`. **Obligatoria y distinta en cada servidor** si varios escriben en la misma base: también separa sus posiciones en `posicion`. No cambiarla después sin mover sus filas de `posicion`, o el servicio arranca desde el final de los archivos |
+   | `LANTANO_PG_SSLMODE` | No | `prefer` | `require` exige SSL; `verify-full` además valida certificado y nombre del host. La plantilla trae `require` |
+   | `LANTANO_PG_SSLROOTCERT` | No | | Ruta al certificado de la CA, necesario con `verify-ca` / `verify-full` (legible por `lantano`) |
+   | `LANTANO_ACCESS_GLOB` | No | `/var/log/nginx/*access*.log` o `/var/log/apache2/*access*.log` | Archivos de acceso vigilados (según `LANTANO_ORIGEN`) |
+   | `LANTANO_ERROR_GLOB` | No | `/var/log/nginx/*error*.log` o `/var/log/apache2/*error*.log` | Archivos de error vigilados (según `LANTANO_ORIGEN`) |
+   | `LANTANO_LOTE` | No | `500` | Filas por inserción |
+   | `LANTANO_INTERVALO` | No | `5` | Segundos máximos entre guardados |
+   | `LANTANO_ESCANEO` | No | `1` | Segundos de espera cuando no hay líneas nuevas |
+   | `LANTANO_EXCLUIR` | No | vacío | Regex sobre la URI; lo que coincide no se guarda |
+   | `LANTANO_PARAMETROS_OCULTOS` | No | `token,password,key,secret` | Parámetros de URL cuyo valor se guarda como `***`. Basta con que el nombre contenga la palabra: `key` oculta `api_key`, `token` oculta `access_token` |
 
-4. Crear las tablas. Usa la conexión del `.env` (usuario, clave, host, base y SSL):
+4. Crear las tablas. Usa la conexión del `.env` (usuario, clave, host, base y SSL). Con varios servidores web
+   basta con hacerlo en el primero; en los demás no cambia nada:
 
    ```bash
    cd /opt/lantano && sudo venv/bin/python migrar.py
    ```
 
-   Debe mostrar `Aplicada 0001_inicial.sql` y una línea por cada migración siguiente.
+   Debe mostrar `Aplicada 0001_inicial.sql` (y una línea por cada migración siguiente, si las hay).
 
 5. Instalar y arrancar el servicio:
 
@@ -259,7 +354,8 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
    journalctl -u lantano -n 50
    ```
 
-   Debe aparecer `Conectado a PostgreSQL.` y una línea `Vigilando ...` por cada archivo de log.
+   Deben aparecer `Origen: nginx.` (o `apache`), `Conectado a PostgreSQL.` y una línea `Vigilando ...` por cada
+   archivo de log.
 
 2. Generar tráfico y confirmar que llega a la base (esperar unos 5 s):
 
@@ -268,13 +364,14 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
    ```
 
    ```sql
-   SELECT servidor, archivo, posicion, actualizado FROM nginx_posicion ORDER BY actualizado DESC;
-   SELECT fecha, host, ip, ip_real, ruta, parametros, status FROM nginx_acceso ORDER BY id DESC LIMIT 5;
-   SELECT count(*) FROM nginx_linea_invalida WHERE creado > now() - interval '1 hour';
+   SELECT servidor, archivo, posicion, actualizado FROM posicion ORDER BY actualizado DESC;
+   SELECT fecha, origen, host, ip, ip_real, ruta, parametros, status FROM acceso ORDER BY id DESC LIMIT 5;
+   SELECT archivo, linea, motivo FROM linea_invalida WHERE creado > now() - interval '1 hour' ORDER BY id DESC LIMIT 5;
    ```
 
-   Si `nginx_linea_invalida` se llena con líneas de acceso, `access.log` sigue recibiendo el formato por defecto:
-   revisar que en `nginx.conf` no quedó la línea `access_log` original (paso 1.2).
+   Si `linea_invalida` se llena con líneas de acceso, el servidor web sigue escribiendo en el formato por defecto:
+   con nginx, revisar que en `nginx.conf` no quedó la línea `access_log` original (paso 1A.2); con Apache, que
+   todos los `CustomLog` usan `json_log` y que `other-vhosts-access-log` está desactivado (pasos 1B.2 y 1B.4).
 
    En un sitio detrás de Cloudflare, `ip` debe ser un nodo de Cloudflare e `ip_real` la IP pública de quien hizo
    la petición.
@@ -285,8 +382,51 @@ El servicio empieza a leer desde el **final** de los archivos: los logs anterior
    de Cloudflare. La fila debe tener `ip_real` igual a la IP de esa máquina, no `1.2.3.4`:
 
    ```bash
-   curl -sk -o /dev/null --resolve <sitio>:443:<ip_servidor_nginx> -H 'CF-Connecting-IP: 1.2.3.4' https://<sitio>/
+   curl -sk -o /dev/null --resolve <sitio>:443:<ip_servidor_web> -H 'CF-Connecting-IP: 1.2.3.4' https://<sitio>/
    ```
+
+## Pasar a esta versión desde la de tablas `nginx_*`
+
+Esta versión renombra las tablas (`nginx_acceso` → `acceso`, `nginx_error` → `error`, `nginx_posicion` →
+`posicion`, `nginx_linea_invalida` → `linea_invalida`), el script (`leer_log_nginx.py` → `leer_log.py`) y las
+variables del `.env` (`NGINX_*` → `LANTANO_*`), y reúne todas las migraciones en una sola `0001_inicial.sql`. No
+se migran los datos: se borra la base anterior y se crea `bdlantano` desde cero. `actualizar_lantano.sh` no sirve
+para este paso (fallaría en `migrar.py` por las variables del `.env`); hacerlo a mano:
+
+1. *Servidor web* (en cada uno). Detener el servicio: desde aquí hasta el paso 4 las peticiones no se guardan,
+   porque el servicio nuevo arranca desde el final de los archivos.
+
+   ```bash
+   sudo systemctl stop lantano
+   ```
+
+2. *Servidor de base de datos.* Borrar la base anterior (y su usuario, si tenía otro nombre) y crear la nueva
+   como en el [paso 2](#paso-2-base-de-datos), incluyendo la línea de `pg_hba.conf`:
+
+   ```sql
+   DROP DATABASE <base_anterior>;
+   DROP USER <usuario_anterior>;          -- solo si no se llamaba lantano
+   CREATE USER lantano WITH PASSWORD '<clave>';   -- si ya existía: ALTER USER lantano WITH PASSWORD '<clave>';
+   CREATE DATABASE bdlantano OWNER lantano;
+   ```
+
+3. *Servidor web* (en cada uno). Actualizar el código y el `.env`, crear las tablas (una sola vez) y arrancar:
+
+   ```bash
+   cd /opt/lantano
+   sudo git pull
+   sudo venv/bin/pip install -r requirements.txt
+   sudo sed -i 's/^NGINX_/LANTANO_/' .env
+   sudo nano .env      # agregar LANTANO_ORIGEN=nginx (o apache) y revisar USER=lantano, NAME=bdlantano, CLAVE
+   sudo venv/bin/python migrar.py
+   sudo cp lantano.service /etc/systemd/system/ && sudo systemctl daemon-reload
+   sudo systemctl start lantano
+   ```
+
+4. Hacer la [verificación](#paso-4-verificación).
+
+Los servidores nginx ya configurados no cambian nada en nginx. Los servidores Apache se configuran con el paso 1B
+antes del paso 3.
 
 ## Actualizar
 
@@ -316,7 +456,7 @@ journalctl -u lantano -f
 (`lantano_migracion`) con la última migración de su código y se detiene si no coinciden. Para ver qué está
 aplicado: `sudo venv/bin/python migrar.py --estado`.
 
-Con varios servidores nginx en la misma base, la migración se ejecuta una sola vez (desde el primero que se
+Con varios servidores web en la misma base, la migración se ejecuta una sola vez (desde el primero que se
 actualiza; en los demás `migrar.py` no hace nada). Los servidores que aún tienen el código anterior:
 
 - Si siguen corriendo y la migración cambió columnas que usan, reintentan sin avanzar ni perder líneas hasta que
@@ -324,43 +464,6 @@ actualiza; en los demás `migrar.py` no hace nada). Los servidores que aún tien
 - Si se reinician antes de actualizarse, se detienen con `más nueva que el código`.
 
 Durante el reinicio no se pierden líneas: al arrancar continúa desde la posición guardada.
-
-### Activar `ip_real` y quitar `usuario` en un servidor ya instalado
-
-Para servidores instalados antes de las migraciones `0004_ip_real.sql` y `0005_quitar_usuario.sql`. Mientras no se
-haga, `ip_real` queda en `NULL` en las filas de ese servidor; las filas anteriores al cambio quedan en `NULL` para
-siempre. El campo `usuario` que siga llegando en el log se ignora.
-
-1. Actualizar Lantano (`actualizar_lantano.sh`, ver arriba). Con varios servidores, en todos.
-2. Revisar qué más usa `$remote_addr` en la configuración de nginx (ver el paso 1, "Mientras se use este esquema"):
-
-   ```bash
-   sudo nginx -T 2>/dev/null | grep -nE 'remote_addr|allow |deny |limit_req_zone|limit_conn_zone|geo |X-Real-IP|X-Forwarded-For'
-   sudo nginx -V 2>&1 | grep -o with-http_realip_module
-   ```
-
-3. Crear `/etc/nginx/conf.d/cloudflare-realip.conf` como en el paso 1.3, **sin recargar** nginx: `real_ip` y el
-   nuevo `log_format` deben entrar en el mismo reload. Si se recarga solo `real_ip` con el `log_format` anterior
-   (`"ip":"$remote_addr"`), la columna `ip` pasa a guardar la IP del cliente.
-
-4. En `/etc/nginx/nginx.conf`, cambiar el `log_format` como en el paso 1.2: agregar `ip_real` y quitar `usuario`:
-
-   ```diff
-   -log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$remote_addr",'
-   +log_format json_log escape=json '{"time":"$time_iso8601","host":"$host","ip":"$realip_remote_addr",'
-   +  '"ip_real":"$remote_addr",'
-      ...
-   -  '"usuario":"$upstream_http_x_usuario","api_key":"$api_key_prefijo"}';
-   +  '"api_key":"$api_key_prefijo"}';
-   ```
-
-   Si algún sitio tiene `proxy_hide_header X-Usuario;`, dejarlo mientras la aplicación siga enviando esa cabecera:
-   evita que llegue al navegador.
-
-5. `sudo nginx -t && sudo systemctl reload nginx` y hacer las pruebas del paso 4 (puntos 2 y 4).
-
-Para deshacerlo: `sudo rm /etc/nginx/conf.d/cloudflare-realip.conf`, volver al
-`log_format` anterior, `nginx -t` y `reload`. Lantano sigue funcionando y guarda `ip_real` en `NULL`.
 
 ## Revertir
 
@@ -381,6 +484,9 @@ solo avanzan. En ese caso hay dos opciones:
 - Deshacer a mano los cambios de esas migraciones y borrar sus filas: `DELETE FROM lantano_migracion WHERE
   version > <n>;`, donde `<n>` es la última migración del commit anterior (`ls migraciones/`).
 
+No se puede revertir a una versión anterior a la de tablas sin prefijo (`leer_log_nginx.py`): usaba otro esquema
+y otras variables del `.env`.
+
 ## Desinstalar
 
 ```bash
@@ -390,35 +496,40 @@ sudo rm -rf /opt/lantano
 sudo userdel lantano
 ```
 
-Las tablas y los datos quedan en la base de datos; borrarlos es una decisión aparte.
+La configuración del servidor web (paso 1A o 1B) y la base `bdlantano` se quedan; deshacerlas es una decisión
+aparte (ver "Para volver al formato por defecto" en el paso 1).
 
 ## Problemas frecuentes
 
 | Síntoma en `journalctl -u lantano` | Causa | Solución |
 | --- | --- | --- |
-| `La base de datos no tiene las tablas. Ejecute migrar.py.` y el servicio se reinicia cada 10 s | Falta el paso 3.4 o se apunta a otra base | Ejecutar `migrar.py` (usa la base de `NGINX_PG_DATABASE_NAME`) |
+| `UndefinedValueError: LANTANO_PG_DATABASE_USER not found` | `.env` con los nombres anteriores (`NGINX_*`) o sin completar | `sudo sed -i 's/^NGINX_/LANTANO_/' /opt/lantano/.env` y completar lo que falte (paso 3.3) |
+| `LANTANO_ORIGEN debe ser nginx o apache` | Valor mal escrito en `.env` | Corregirlo y reiniciar |
+| `La base de datos no tiene las tablas. Ejecute migrar.py.` y el servicio se reinicia cada 10 s | Falta el paso 3.4 o se apunta a otra base | Ejecutar `migrar.py` (usa la base de `LANTANO_PG_DATABASE_NAME`) |
 | `La base de datos está en la versión N y el código espera la M. Ejecute migrar.py.` | Se actualizó el código sin migrar | Ejecutar `migrar.py` |
 | `La base de datos está en la versión N, más nueva que el código (M). Actualice el código.` | Otro servidor ya migró la base, o se revirtió el código | Actualizar el código (ver [Actualizar](#actualizar)) o [Revertir](#revertir) |
 | `Error de base de datos: column "..." of relation "..." does not exist. Reintento en N s.` | Otro servidor migró la base y este sigue corriendo con el código anterior | Actualizar el código de este servidor; mientras tanto no pierde líneas |
-| `Error de base de datos: ... Reintento en N s.` | Sin red, `pg_hba.conf`, firewall o clave incorrecta | Probar con `psql` desde el servidor nginx (paso 2.4) |
-| `server does not support SSL, but SSL was required` | `NGINX_PG_SSLMODE=require` y PostgreSQL sin SSL | Configurar SSL en PostgreSQL o usar `NGINX_PG_SSLMODE=prefer` |
-| `root certificate file ... does not exist` o `certificate verify failed` | `verify-full` sin `NGINX_PG_SSLROOTCERT` válido o el host no coincide con el certificado | Revisar la ruta y permisos del certificado y que `NGINX_PG_DATABASE_HOST` sea el nombre del certificado |
-| `migrar.py`: `permission denied for schema public` (o `permiso denegado al esquema public`) | El usuario del `.env` no es dueño de la base | Como administrador: `ALTER DATABASE <base> OWNER TO lognginx;` y repetir `migrar.py` |
+| `Error de base de datos: ... Reintento en N s.` | Sin red, `pg_hba.conf`, firewall o clave incorrecta | Probar con `psql` desde el servidor web (paso 2.4) |
+| `server does not support SSL, but SSL was required` | `LANTANO_PG_SSLMODE=require` y PostgreSQL sin SSL | Configurar SSL en PostgreSQL o usar `LANTANO_PG_SSLMODE=prefer` |
+| `root certificate file ... does not exist` o `certificate verify failed` | `verify-full` sin `LANTANO_PG_SSLROOTCERT` válido o el host no coincide con el certificado | Revisar la ruta y permisos del certificado y que `LANTANO_PG_DATABASE_HOST` sea el nombre del certificado |
+| `migrar.py`: `permission denied for schema public` (o `permiso denegado al esquema public`) | El usuario del `.env` no es dueño de la base | Como administrador: `ALTER DATABASE bdlantano OWNER TO lantano;` y repetir `migrar.py` |
 | `No se puede abrir ...: Permission denied` | `lantano` no está en el grupo `adm` | `sudo usermod -aG adm lantano && sudo systemctl restart lantano` |
-| `No hay archivos que coincidan con ...` | No existen `/var/log/nginx/access.log` ni `error.log` | Revisar el paso 1 y las rutas en `NGINX_ACCESS_GLOB` / `NGINX_ERROR_GLOB` |
+| `No hay archivos que coincidan con ...` | No existen los logs en la ruta del origen, o `LANTANO_ORIGEN` no corresponde al servidor web | Revisar el paso 1, `LANTANO_ORIGEN` y `LANTANO_ACCESS_GLOB` / `LANTANO_ERROR_GLOB` |
 | `fue rotado y no se encontró el archivo anterior; pueden faltar líneas` | El servicio estuvo detenido durante una rotación y el archivo ya se comprimió | Sin acción; vigilar que el servicio no quede detenido más de un día |
-| En un sitio detrás de Cloudflare, filas con `ip_real = ip` y una IP de Cloudflare | Falta `cloudflare-realip.conf`, se creó sin recargar nginx, o Cloudflare agregó un rango nuevo | Comparar el archivo con https://www.cloudflare.com/ips/, corregirlo, `nginx -t` y `reload` (paso 1.3) |
+| `linea_invalida` con `formato de error de Apache no reconocido` | `ErrorLogFormat` personalizado en Apache | Quitarlo para usar el formato por defecto (paso 1B.1) |
+| `linea_invalida` con líneas de acceso en formato `combined` (Apache) | Un sitio con `CustomLog ... combined` o `other-vhosts-access-log` activo | Pasos 1B.2 y 1B.4 |
+| En un sitio detrás de Cloudflare, filas con `ip_real = ip` y una IP de Cloudflare | Falta la configuración de IP real (`cloudflare-realip.conf` en nginx, `lantano.conf` + `mod_remoteip` en Apache), no se recargó el servidor web, o Cloudflare agregó un rango nuevo | Comparar los rangos con https://www.cloudflare.com/ips/, corregirlos y recargar (paso 1A.3 o 1B.3) |
 | `ModuleNotFoundError` o `UndefinedValueError` | Dependencias sin instalar o falta una variable obligatoria en `.env` | Repetir `pip install` o completar `.env` |
 
 Para ver más detalle temporalmente, ejecutar a mano con el usuario del servicio:
 
 ```bash
 sudo systemctl stop lantano
-sudo -u lantano /opt/lantano/venv/bin/python /opt/lantano/leer_log_nginx.py --debug
+sudo -u lantano /opt/lantano/venv/bin/python /opt/lantano/leer_log.py --debug
 sudo systemctl start lantano
 ```
 
 ## Pendientes conocidos
 
-- **Retención de datos:** no hay limpieza automática; `nginx_acceso` crece con cada petición. Definir cuántos
-  días se guardan y programar el borrado.
+- **Retención de datos:** no hay limpieza automática; `acceso` crece con cada petición. Definir cuántos días se
+  guardan y programar el borrado.

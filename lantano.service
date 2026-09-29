@@ -1,13 +1,13 @@
 [Unit]
-Description=Lantano: logs de nginx hacia PostgreSQL
-After=network-online.target nginx.service
+Description=Lantano: logs de nginx o Apache hacia PostgreSQL
+After=network-online.target nginx.service apache2.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=lantano
 WorkingDirectory=/opt/lantano
-ExecStart=/opt/lantano/venv/bin/python /opt/lantano/leer_log_nginx.py
+ExecStart=/opt/lantano/venv/bin/python /opt/lantano/leer_log.py
 Restart=always
 RestartSec=10
 NoNewPrivileges=true

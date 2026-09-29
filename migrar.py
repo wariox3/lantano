@@ -6,7 +6,7 @@ Aplica en orden las migraciones de migraciones/ que falten en la base de datos.
   su propia transacción y se registra en lantano_migracion.
 - Solo avanzan: para deshacer un cambio se escribe una migración nueva.
 - Un bloqueo de PostgreSQL evita que dos ejecuciones simultáneas (por ejemplo,
-  desde dos servidores nginx) apliquen la misma migración.
+  desde dos servidores web) apliquen la misma migración.
 
 Se conecta con los datos del .env, igual que el servicio; el usuario debe ser
 dueño de la base.
@@ -109,8 +109,8 @@ def main():
     parser.add_argument('--estado', action='store_true', help='muestra las migraciones aplicadas y pendientes')
     argumentos = parser.parse_args()
 
-    # Importación diferida: leer_log_nginx importa ultima_version de este módulo
-    from leer_log_nginx import crear_conexion
+    # Importación diferida: leer_log importa ultima_version de este módulo
+    from leer_log import crear_conexion
     try:
         conexion = crear_conexion()
     except psycopg2.OperationalError as e:

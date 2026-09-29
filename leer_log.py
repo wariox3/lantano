@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Lee de forma continua los logs de nginx (access en formato JSON y error) y los
-guarda en PostgreSQL. Pensado para correr como servicio de systemd.
+Lee de forma continua los logs de nginx o de Apache (access en formato JSON y
+error) y los guarda en PostgreSQL. Pensado para correr como servicio de systemd.
 
+- LANTANO_ORIGEN elige el servidor web (nginx o apache): las rutas por defecto
+  de los logs y el formato del log de errores.
 - Arranca desde el final de los archivos: no carga lo que ya existe.
-- Guarda en nginx_posicion el inode y la posición leída de cada archivo, en la
-  misma transacción que los registros, para continuar tras un reinicio sin
-  duplicar ni perder líneas.
+- Guarda en posicion el inode y la posición leída de cada archivo, en la misma
+  transacción que los registros, para continuar tras un reinicio sin duplicar
+  ni perder líneas.
 - Detecta la rotación de logrotate y termina de leer el archivo anterior.
 - Si la base de datos no responde, deja de avanzar y reintenta.
 
@@ -14,7 +16,7 @@ Las tablas se crean antes con migrar.py. Al arrancar verifica que la base tenga
 la última migración que trae el código.
 
 Uso:
-    python3 leer_log_nginx.py
+    python3 leer_log.py
 """
 import argparse
 import glob
@@ -34,17 +36,20 @@ from decouple import config, Csv
 
 from migrar import ultima_version
 
-ACCESS_GLOB = config('NGINX_ACCESS_GLOB', default='/var/log/nginx/*access*.log')
-ERROR_GLOB = config('NGINX_ERROR_GLOB', default='/var/log/nginx/*error*.log')
-LOTE = config('NGINX_LOTE', default=500, cast=int)
-INTERVALO = config('NGINX_INTERVALO', default=5, cast=float)
-ESCANEO = config('NGINX_ESCANEO', default=1, cast=float)
-EXCLUIR = config('NGINX_EXCLUIR', default='')
-PARAMETROS_OCULTOS = config('NGINX_PARAMETROS_OCULTOS', default='token,password,key,secret', cast=Csv())
-SERVIDOR = config('NGINX_SERVIDOR', default='') or None
-SERVIDOR_POSICION = SERVIDOR or ''  # clave en nginx_posicion, que no admite NULL
-SSLMODE = config('NGINX_PG_SSLMODE', default='prefer')
-SSLROOTCERT = config('NGINX_PG_SSLROOTCERT', default='') or None
+ORIGENES = {'nginx': '/var/log/nginx', 'apache': '/var/log/apache2'}
+ORIGEN = config('LANTANO_ORIGEN', default='nginx')
+DIRECTORIO_LOGS = ORIGENES.get(ORIGEN, ORIGENES['nginx'])
+ACCESS_GLOB = config('LANTANO_ACCESS_GLOB', default='') or f'{DIRECTORIO_LOGS}/*access*.log'
+ERROR_GLOB = config('LANTANO_ERROR_GLOB', default='') or f'{DIRECTORIO_LOGS}/*error*.log'
+LOTE = config('LANTANO_LOTE', default=500, cast=int)
+INTERVALO = config('LANTANO_INTERVALO', default=5, cast=float)
+ESCANEO = config('LANTANO_ESCANEO', default=1, cast=float)
+EXCLUIR = config('LANTANO_EXCLUIR', default='')
+PARAMETROS_OCULTOS = config('LANTANO_PARAMETROS_OCULTOS', default='token,password,key,secret', cast=Csv())
+SERVIDOR = config('LANTANO_SERVIDOR', default='') or None
+SERVIDOR_POSICION = SERVIDOR or ''  # clave en posicion, que no admite NULL
+SSLMODE = config('LANTANO_PG_SSLMODE', default='prefer')
+SSLROOTCERT = config('LANTANO_PG_SSLROOTCERT', default='') or None
 
 DESCUBRIMIENTO = 30        # segundos entre búsquedas de archivos nuevos
 GRACIA_ROTACION = 5        # segundos leyendo el archivo rotado antes de cambiar al nuevo
@@ -61,46 +66,57 @@ PATRON_OCULTOS = re.compile(
     re.IGNORECASE,
 ) if PARAMETROS_OCULTOS else None
 
-PATRON_ERROR = re.compile(
+# nginx: 2026/09/29 10:00:00 [error] 1234#5678: *90 mensaje, client: 1.2.3.4, server: ...
+PATRON_ERROR_NGINX = re.compile(
     r'^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (\d+)#(\d+): (?:\*(\d+) )?(.*)$'
 )
-PATRON_CAMPOS_ERROR = re.compile(
+PATRON_CAMPOS_ERROR_NGINX = re.compile(
     r', (client|server|request|upstream|host|referrer): ("(?:[^"\\]|\\.)*"|[^,]*)'
 )
+# Apache 2.4 (ErrorLogFormat por defecto):
+# [Tue Sep 29 10:00:00.123456 2026] [proxy:error] [pid 1234:tid 5678] (111)...: [client 1.2.3.4:5678] AH01114: mensaje, referer: ...
+PATRON_ERROR_APACHE = re.compile(
+    r'^\[([^\]]+)\] \[([^\]:]*):(\w+)\] \[pid (\d+)(?::tid (\d+))?\] (.*)$'
+)
+PATRON_CLIENTE_APACHE = re.compile(r'\[client ([^\]]+)\] ')
+PATRON_REFERER_APACHE = re.compile(r', referer: (\S*)$')
+FORMATOS_FECHA_APACHE = ('%a %b %d %H:%M:%S.%f %Y', '%a %b %d %H:%M:%S %Y')
+# Apache escapa en el log de acceso los bytes no imprimibles o no ASCII como \xhh, que no es JSON válido.
+# Se consume cada escape completo para no confundir \\x41 (barra invertida seguida de x41) con un byte.
+PATRON_ESCAPES_APACHE = re.compile(r'(?:\\x[0-9a-fA-F]{2})+|\\v|\\.')
 
 SQL_ACCESO = '''
-    INSERT INTO nginx_acceso (fecha, archivo, host, ip, metodo, ruta, parametros, protocolo, status, bytes,
-                              referer, user_agent, request_time, upstream_time, upstream, servidor, api_key,
-                              ip_real)
+    INSERT INTO acceso (origen, fecha, archivo, host, ip, metodo, ruta, parametros, protocolo, status, bytes,
+                        referer, user_agent, request_time, upstream_time, upstream, servidor, api_key, ip_real)
     VALUES %s
 '''
 SQL_ERROR = '''
-    INSERT INTO nginx_error (fecha, archivo, nivel, pid, tid, cid, mensaje, client, server,
-                             request, upstream, host, referer, servidor)
+    INSERT INTO error (origen, fecha, archivo, nivel, modulo, pid, tid, cid, mensaje, client, server,
+                       request, upstream, host, referer, servidor)
     VALUES %s
 '''
-SQL_INVALIDA = 'INSERT INTO nginx_linea_invalida (archivo, linea, motivo) VALUES %s'
+SQL_INVALIDA = 'INSERT INTO linea_invalida (archivo, linea, motivo) VALUES %s'
 SQL_POSICION = '''
-    INSERT INTO nginx_posicion (servidor, archivo, inode, posicion) VALUES %s
+    INSERT INTO posicion (servidor, archivo, inode, posicion) VALUES %s
     ON CONFLICT (servidor, archivo) DO UPDATE
     SET inode = EXCLUDED.inode, posicion = EXCLUDED.posicion, actualizado = now()
 '''
 
 
-log = logging.getLogger('leer_log_nginx')
+log = logging.getLogger('lantano')
 
 
 def crear_conexion():
     return psycopg2.connect(
-        user=config('NGINX_PG_DATABASE_USER'),
-        password=config('NGINX_PG_DATABASE_CLAVE'),
-        host=config('NGINX_PG_DATABASE_HOST'),
-        port=config('NGINX_PG_DATABASE_PORT', default='5432'),
-        dbname=config('NGINX_PG_DATABASE_NAME'),
+        user=config('LANTANO_PG_DATABASE_USER'),
+        password=config('LANTANO_PG_DATABASE_CLAVE'),
+        host=config('LANTANO_PG_DATABASE_HOST'),
+        port=config('LANTANO_PG_DATABASE_PORT', default='5432'),
+        dbname=config('LANTANO_PG_DATABASE_NAME'),
         sslmode=SSLMODE,
         sslrootcert=SSLROOTCERT,
         connect_timeout=10,
-        application_name='leer_log_nginx',
+        application_name=f'lantano_{ORIGEN}',
         keepalives=1,
         keepalives_idle=30,
         keepalives_interval=10,
@@ -150,18 +166,44 @@ def prefijo_api_key(valor):
     return texto(valor.split('.', 1)[0]) if valor else None
 
 
+def json_apache(linea):
+    """Convierte los escapes de Apache que no son JSON: \\xhh (bytes, en UTF-8 si se puede) y \\v."""
+    def convertir(coincidencia):
+        escape = coincidencia.group(0)
+        if escape == '\\v':
+            return '\\u000b'
+        if escape.startswith('\\x'):
+            decodificado = bytes.fromhex(escape.replace('\\x', '')).decode('utf-8', errors='replace')
+            # Los bytes de control quedan crudos; json.loads(strict=False) los acepta dentro de las cadenas
+            return decodificado.replace('\\', '\\\\').replace('"', '\\"')
+        return escape
+    return PATRON_ESCAPES_APACHE.sub(convertir, linea)
+
+
 def parsear_acceso(linea, archivo):
-    """Devuelve la fila para nginx_acceso, None si la línea está excluida o lanza ValueError."""
-    datos = json.loads(linea)
+    """Devuelve la fila para acceso, None si la línea está excluida o lanza ValueError."""
+    if ORIGEN == 'apache':
+        datos = json.loads(json_apache(linea), strict=False)
+    else:
+        datos = json.loads(linea)
     if not isinstance(datos, dict):
         raise ValueError('la línea no es un objeto JSON')
     if not datos.get('time'):
         raise ValueError('falta el campo time')
-    uri = ocultar(texto(datos.get('uri')))
+    uri = datos.get('uri')
+    if uri is None and datos.get('request'):
+        # Apache: la URI sin decodificar solo está en la línea de petición (%r, "GET /ruta?query HTTP/1.1")
+        partes = str(datos['request']).split(' ')
+        uri = partes[1] if len(partes) >= 2 else None
+    uri = ocultar(texto(uri))
     if PATRON_EXCLUIR and uri and PATRON_EXCLUIR.search(uri):
         return None
     ruta, _, parametros = (uri or '').partition('?')
+    request_time = decimal(datos.get('request_time'))
+    if ORIGEN == 'apache' and request_time is not None:
+        request_time /= 1_000_000  # %D de Apache está en microsegundos
     return (
+        ORIGEN,
         datetime.fromisoformat(datos['time']),
         archivo,
         texto(datos.get('host')),
@@ -174,7 +216,7 @@ def parsear_acceso(linea, archivo):
         entero(datos.get('bytes')),
         ocultar(texto(datos.get('referer'))),
         texto(datos.get('user_agent')),
-        decimal(datos.get('request_time')),
+        request_time,
         texto(datos.get('upstream_time')),
         texto(datos.get('upstream')),
         SERVIDOR,
@@ -183,16 +225,16 @@ def parsear_acceso(linea, archivo):
     )
 
 
-def parsear_error(linea, archivo):
-    """Devuelve la fila para nginx_error o lanza ValueError."""
-    coincidencia = PATRON_ERROR.match(linea)
+def parsear_error_nginx(linea, archivo):
+    """Devuelve la fila para error o lanza ValueError."""
+    coincidencia = PATRON_ERROR_NGINX.match(linea)
     if not coincidencia:
-        raise ValueError('formato de error no reconocido')
+        raise ValueError('formato de error de nginx no reconocido')
     fecha, nivel, pid, tid, cid, resto = coincidencia.groups()
 
     campos = {}
     inicio_campos = len(resto)
-    for campo in PATRON_CAMPOS_ERROR.finditer(resto):
+    for campo in PATRON_CAMPOS_ERROR_NGINX.finditer(resto):
         if campo.group(1) in campos:
             continue
         inicio_campos = min(inicio_campos, campo.start())
@@ -202,9 +244,11 @@ def parsear_error(linea, archivo):
         campos[campo.group(1)] = valor
 
     return (
+        'nginx',
         datetime.strptime(fecha, '%Y/%m/%d %H:%M:%S').astimezone(),
         archivo,
         nivel,
+        None,
         entero(pid),
         entero(tid),
         entero(cid),
@@ -219,11 +263,64 @@ def parsear_error(linea, archivo):
     )
 
 
+def fecha_apache(valor):
+    for formato in FORMATOS_FECHA_APACHE:
+        try:
+            return datetime.strptime(valor, formato).astimezone()
+        except ValueError:
+            continue
+    raise ValueError(f'fecha de Apache no reconocida: {valor}')
+
+
+def parsear_error_apache(linea, archivo):
+    """Devuelve la fila para error o lanza ValueError."""
+    coincidencia = PATRON_ERROR_APACHE.match(linea)
+    if not coincidencia:
+        raise ValueError('formato de error de Apache no reconocido')
+    fecha, modulo, nivel, pid, tid, mensaje = coincidencia.groups()
+
+    client = None
+    cliente = PATRON_CLIENTE_APACHE.search(mensaje)
+    if cliente:
+        client = cliente.group(1).rsplit(':', 1)[0]  # ip:puerto, también en IPv6 (2001:db8::1:5678)
+        mensaje = mensaje[:cliente.start()] + mensaje[cliente.end():]
+    referer = None
+    coincidencia_referer = PATRON_REFERER_APACHE.search(mensaje)
+    if coincidencia_referer:
+        referer = coincidencia_referer.group(1)
+        mensaje = mensaje[:coincidencia_referer.start()]
+
+    return (
+        'apache',
+        fecha_apache(fecha),
+        archivo,
+        nivel,
+        texto(modulo),
+        entero(pid),
+        entero(tid),
+        None,
+        ocultar(texto(mensaje)),
+        ip(client),
+        None,
+        None,
+        None,
+        None,
+        ocultar(texto(referer)),
+        SERVIDOR,
+    )
+
+
+def parsear_error(linea, archivo):
+    if ORIGEN == 'apache':
+        return parsear_error_apache(linea, archivo)
+    return parsear_error_nginx(linea, archivo)
+
+
 # --- Lectura continua ---------------------------------------------------------
 
 class ArchivoLog:
     def __init__(self, ruta, tipo):
-        self.ruta = ruta          # ruta vigilada, clave en nginx_posicion
+        self.ruta = ruta          # ruta vigilada, clave en posicion
         self.tipo = tipo          # 'acceso' o 'error'
         self.fh = None
         self.inode = None
@@ -238,7 +335,7 @@ class ArchivoLog:
             self.fh = None
 
 
-class LectorNginx:
+class Lector:
     def __init__(self):
         self.conexion = None
         self.archivos = {}
@@ -285,7 +382,7 @@ class LectorNginx:
                 with self.conexion, self.conexion.cursor() as cursor:
                     self.verificar_version(cursor)
                     cursor.execute(
-                        'SELECT archivo, inode, posicion FROM nginx_posicion WHERE servidor = %s',
+                        'SELECT archivo, inode, posicion FROM posicion WHERE servidor = %s',
                         (SERVIDOR_POSICION,),
                     )
                     return {archivo: (int(inode), posicion) for archivo, inode, posicion in cursor.fetchall()}
@@ -324,7 +421,7 @@ class LectorNginx:
             self.guardar_posiciones(cursor)
 
     def insertar_individual(self):
-        """Inserta fila por fila; las que fallan por sus datos van a nginx_linea_invalida.
+        """Inserta fila por fila; las que fallan por sus datos van a linea_invalida.
 
         Otros errores se propagan y se deshace toda la transacción.
         """
@@ -338,7 +435,7 @@ class LectorNginx:
                         cursor.execute('RELEASE SAVEPOINT fila')
                     except ERRORES_DE_FILA as e:
                         cursor.execute('ROLLBACK TO SAVEPOINT fila')
-                        invalidas.append((fila[1], repr(fila), f'{type(e).__name__}: {str(e).strip()}'))
+                        invalidas.append((fila[2], repr(fila), f'{type(e).__name__}: {str(e).strip()}'))
             if invalidas:
                 execute_values(cursor, SQL_INVALIDA, invalidas)
             self.guardar_posiciones(cursor)
@@ -567,7 +664,7 @@ def buscar_rotado(ruta, inode):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Lee los logs de nginx y los guarda en PostgreSQL.')
+    parser = argparse.ArgumentParser(description='Lee los logs de nginx o Apache y los guarda en PostgreSQL.')
     parser.add_argument('--debug', action='store_true', help='muestra mensajes de depuración')
     argumentos = parser.parse_args()
 
@@ -575,7 +672,11 @@ def main():
         level=logging.DEBUG if argumentos.debug else logging.INFO,
         format='%(asctime)s %(levelname)s %(message)s',
     )
-    LectorNginx().ejecutar()
+    if ORIGEN not in ORIGENES:
+        log.error('LANTANO_ORIGEN debe ser %s, no %r.', ' o '.join(ORIGENES), ORIGEN)
+        sys.exit(1)
+    log.info('Origen: %s.', ORIGEN)
+    Lector().ejecutar()
 
 
 if __name__ == '__main__':
