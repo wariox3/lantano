@@ -207,10 +207,13 @@ configura `mod_remoteip` y `ip_real` es igual a `ip`.
    # Antes
    CustomLog ${APACHE_LOG_DIR}/access.log combined
    # Después
-   CustomLog ${APACHE_LOG_DIR}/access.log json_log
+   CustomLog ${APACHE_LOG_DIR}/access.log json_log env=!dontlog
    ```
 
    - Un sitio sin `CustomLog` usa el de `lantano.conf`, que ya escribe en `access.log` con `json_log`.
+   - `env=!dontlog` evita registrar las conexiones internas de Apache (`OPTIONS *` desde `127.0.0.1` o `::1` con user
+     agent `(internal dummy connection)`, cada pocos segundos). Llegan al sitio por defecto (`000-default.conf`), así
+     que ese sitio debe tenerlo; la condición está en `lantano.conf` (`SetEnvIfExpr`).
    - Si `apache2.conf` tiene un `CustomLog` global activo (por ejemplo `CustomLog ${APACHE_LOG_DIR}/access.log
      combined_parsable`), comentarlo, respaldando antes (`sudo cp /etc/apache2/apache2.conf
      /etc/apache2/apache2.conf.antes-lantano`): junto con el de `lantano.conf`, cada petición se escribiría dos
@@ -242,7 +245,7 @@ configura `mod_remoteip` y `ip_real` es igual a `ip`.
 
 Mientras se use este esquema:
 
-- Un sitio nuevo debe declarar su `CustomLog` con `json_log` (o no declararlo).
+- Un sitio nuevo debe declarar su `CustomLog` con `json_log env=!dontlog` (o no declararlo).
 - Si otra herramienta lee `access.log` en formato `combined` (fail2ban, GoAccess, AWStats), deja de entenderlo.
 - Para volver al formato por defecto: `sudo a2disconf lantano`, restaurar los sitios desde
   `/etc/apache2/sites-available.antes-lantano` (y `apache2.conf` desde `apache2.conf.antes-lantano`, si se
